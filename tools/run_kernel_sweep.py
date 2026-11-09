@@ -15,8 +15,9 @@ Examples:
   # small base model on CIFAR-100 (5 epochs per task instead of 20, 1 seed)
   python tools/run_kernel_sweep.py --config configs/cifar100_inflora.json --epochs 5 --seeds 0 --device 0
 
-  # ImageNet-R, 2 seeds
-  python tools/run_kernel_sweep.py --config configs/mimg10_inflora.json --epochs 10 --seeds 0 1 --device 0
+  # ImageNet-R (10 tasks) from a dataset folder elsewhere, 2 seeds
+  python tools/run_kernel_sweep.py --config configs/mimg10_inflora.json --data_path /data/imagenet-r \
+      --epochs 10 --seeds 0 1 --device 0
 """
 import argparse
 import copy
@@ -68,11 +69,16 @@ def main():
     p.add_argument('--out', default=None, help='output folder (default: kh_runs/<dataset>_e<epochs>[_smoke])')
     p.add_argument('--smoke', action='store_true', help='1 epoch and capped training loop: checks the pipeline only')
     p.add_argument('--extract_batch_size', type=int, default=128)
+    p.add_argument('--data_path', default=None, help="dataset folder; overrides the config's data_path")
     a = p.parse_args()
 
+    if a.data_path:
+        a.data_path = os.path.abspath(a.data_path)  # resolve before changing directory
     os.chdir(ROOT)  # trainer and data paths are relative to the repository root
     with open(a.config) as fh:
         base_cfg = json.load(fh)
+    if a.data_path:
+        base_cfg['data_path'] = a.data_path
     epochs = 1 if a.smoke else a.epochs
     out = a.out or os.path.join('kh_runs', '{}_e{}{}'.format(base_cfg['dataset'], epochs, '_smoke' if a.smoke else ''))
     os.makedirs(out, exist_ok=True)
