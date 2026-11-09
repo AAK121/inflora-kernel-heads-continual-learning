@@ -1,0 +1,12 @@
+[
+    {"name": "linear_centerl2", "map": "linear", "input_norm": "center_l2"},
+    {"name": "relu10k_none", "map": "relu", "dim": 10000, "input_norm": "none"},
+    {"name": "relu10k_none_val", "map": "relu", "dim": 10000, "input_norm": "none", "ridge": "val"},
+    {"name": "relu10k_centerl2", "map": "relu", "dim": 10000, "input_norm": "center_l2"},
+    {"name": "relu5k_none", "map": "relu", "dim": 5000, "input_norm": "none"},
+    {"name": "rbf5k_centerl2_m0.5", "map": "rbf", "dim": 5000, "input_norm": "center_l2", "bandwidth_mult": 0.5},
+    {"name": "rbf5k_centerl2_m1", "map": "rbf", "dim": 5000, "input_norm": "center_l2", "bandwidth_mult": 1.0},
+    {"name": "rbf5k_centerl2_m2", "map": "rbf", "dim": 5000, "input_norm": "center_l2", "bandwidth_mult": 2.0},
+    {"name": "rbf10k_centerl2_m1", "map": "rbf", "dim": 10000, "input_norm": "center_l2", "bandwidth_mult": 1.0},
+    {"name": "rbf5k_l2_m1", "map": "rbf", "dim": 5000, "input_norm": "l2", "bandwidth_mult": 1.0}
+]

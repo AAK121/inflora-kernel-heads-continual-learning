@@ -52,7 +52,7 @@ class InfLoRA(BaseLearner):
 
         self.topk = 1  # origin is 5
         self.class_num = self._network.class_num
-        self.debug = False
+        self.debug = bool(args.get("debug", False))
 
         self.all_keys = []
         self.feature_list = []

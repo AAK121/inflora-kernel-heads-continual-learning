@@ -15,27 +15,39 @@ def train(args):
     device = copy.deepcopy(args['device'])
     device = device.split(',')
 
+    ckpt_dirs = []
     for seed in seed_list:
         args['seed'] = seed
         args['device'] = device
-        _train(args)
+        ckpt_dirs.append(_train(args))
 
     myseed = 42069  # set a random seed for reproducibility
     torch.backends.cudnn.deterministic = True
     torch.manual_seed(myseed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(myseed)
+    return ckpt_dirs
 
 
 def _train(args):
-    if args['model_name'] in ['InfLoRA', 'InfLoRA_domain', 'InfLoRAb5_domain', 'InfLoRAb5', 'InfLoRA_CA', 'InfLoRA_CA1']:
-        logdir = 'logs/{}/{}_{}_{}/{}/{}/{}/{}_{}-{}'.format(args['dataset'], args['init_cls'], args['increment'], args['net_type'], args['model_name'], args['optim'], args['rank'], args['lamb'], args['lame'], args['lrate'])
-    else:
-        logdir = 'logs/{}/{}_{}_{}/{}/{}'.format(args['dataset'], args['init_cls'], args['increment'], args['net_type'], args['model_name'], args['optim'])
-
+    logdir = _logdir(args)
     if not os.path.exists(logdir):
         os.makedirs(logdir)
     logfilename = os.path.join(logdir, '{}'.format(args['seed']))
+    return _run(args, logfilename)
+
+
+def _logdir(args):
+    if args['model_name'] in ['InfLoRA', 'InfLoRA_domain', 'InfLoRAb5_domain', 'InfLoRAb5', 'InfLoRA_CA', 'InfLoRA_CA1', 'InfLoRA_KH']:
+        logdir = 'logs/{}/{}_{}_{}/{}/{}/{}/{}_{}-{}'.format(args['dataset'], args['init_cls'], args['increment'], args['net_type'], args['model_name'], args['optim'], args['rank'], args['lamb'], args['lame'], args['lrate'])
+    else:
+        logdir = 'logs/{}/{}_{}_{}/{}/{}'.format(args['dataset'], args['init_cls'], args['increment'], args['net_type'], args['model_name'], args['optim'])
+    if args.get('log_tag'):
+        logdir = os.path.join(logdir, args['log_tag'])
+    return logdir
+
+
+def _run(args, logfilename):
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(filename)s] => %(message)s',
@@ -80,6 +92,8 @@ def _train(args):
         # if task >= 3: break
 
         torch.save(model._network.state_dict(), os.path.join(logfilename, "task_{}.pth".format(int(task))))
+
+    return logfilename
 
 def _set_device(args):
     device_type = args['device']
