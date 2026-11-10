@@ -193,7 +193,7 @@ class InfLoRA(BaseLearner):
             mat_list = []
             for module in self._network.modules():
                 if isinstance(module, Attention_LoRA):
-                    mat_list.append(deepcopy(module.cur_matrix))
+                    mat_list.append(module.cur_matrix.detach().cpu().numpy().copy())
                     module.cur_matrix.zero_()
                     module.n_cur_matrix = 0
             # self.update_GPM(mat_list)
