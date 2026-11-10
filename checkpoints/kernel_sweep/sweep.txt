@@ -1,0 +1,13 @@
+config=configs/mimg10_inflora.json epochs/task=10 seeds=[0]
+head                                  final      avg   task-id
+InfLoRA (concat heads)          73.78 +- 0.00    79.72         -
+relu10k_none                    80.02 +- 0.00    75.46    0.8483
+relu10k_centerl2                79.83 +- 0.00    83.86    0.8465
+relu5k_none                     79.75 +- 0.00    83.77    0.8493
+relu10k_none_val                79.48 +- 0.00    83.98    0.8420
+rbf10k_centerl2_m1              79.43 +- 0.00    83.59    0.8440
+rbf5k_l2_m1                     79.27 +- 0.00    83.53    0.8453
+rbf5k_centerl2_m2               79.18 +- 0.00    83.23    0.8432
+rbf5k_centerl2_m1               79.17 +- 0.00    83.42    0.8442
+rbf5k_centerl2_m0.5             79.02 +- 0.00    83.12    0.8442
+linear_centerl2                 77.28 +- 0.00    82.50    0.8315

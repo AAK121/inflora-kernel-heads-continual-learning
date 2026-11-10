@@ -193,7 +193,10 @@ class InfLoRA(BaseLearner):
             mat_list = []
             for module in self._network.modules():
                 if isinstance(module, Attention_LoRA):
+<<<<<<< HEAD
                     # numpy array, not tensor: with numpy>=2, np.linalg.svd(tensor) returns tensors
+=======
+>>>>>>> 1962459614cd6428cbed34216ed914a524aa2bbe
                     mat_list.append(module.cur_matrix.detach().cpu().numpy().copy())
                     module.cur_matrix.zero_()
                     module.n_cur_matrix = 0
