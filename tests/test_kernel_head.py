@@ -199,6 +199,38 @@ class TestAnalyticHead(unittest.TestCase):
             expected = (rss / n) / (1 - torch.trace(S).item() / n) ** 2
             self.assertAlmostEqual(score, expected, delta=1e-6 * max(1.0, expected))
 
+    def test_gcv_when_features_outnumber_samples(self):
+        """D > n with large unnormalized features: GCV must match the exact (dual) value and
+        never select a lambda whose degrees of freedom exceed n (this used to happen)."""
+        x, y = blobs(30, [0, 1, 2, 3, 4], 32, sep=0.6)
+        x = x * 30.0 / x.norm(dim=1, keepdim=True).mean()  # raw-feature scale, as with input_norm='none'
+        grid = [10.0 ** (k / 2.0) for k in range(-16, 17)]
+        head = AnalyticKernelHead(RandomReLUMap(32, 1000, input_norm='none'), ridge='gcv', ridge_grid=grid)
+        head.feature_map.fit(x)
+        head.update(x, y, 5)  # n = 150 < D = 1000
+        H = head._lift(x)
+        K = H @ H.t()  # dual form: S = K (K + l I)^-1 is exact for D > n
+        Y = torch.nn.functional.one_hot(y, 5).double()
+        n = float(len(y))
+        scores = head.gcv_scores()
+        e = torch.linalg.eigvalsh(K).clamp_min(0)
+        for lam in grid:
+            if lam < 1e-8 * float(e[-1]):
+                continue  # the explicit inverse is itself unreliable for extremely small lambda
+            S = K @ torch.linalg.inv(K + lam * torch.eye(len(y), dtype=torch.float64))
+            rss = ((Y - S @ Y) ** 2).sum().item()
+            expected = n * rss / (n - torch.trace(S).item()) ** 2
+            self.assertAlmostEqual(scores[lam], expected, delta=1e-4 * max(1.0, expected), msg='lambda={}'.format(lam))
+        # selection in the regime that broke the old formula (first task, D = 3000 >> n = 300):
+        # it chose a lambda with df == n, i.e. exact interpolation of the training labels
+        x, y = blobs(60, [0, 1, 2, 3, 4], 64, sep=0.6, seed=0)
+        x = x * 30.0 / x.norm(dim=1, keepdim=True).mean()
+        head = build_head({'map': 'relu', 'dim': 3000, 'input_norm': 'none'}, 64)
+        head.fit_task(x, y, 5)
+        e = torch.linalg.eigvalsh(head.G).clamp_min(0)
+        df = float((e / (e + float(head.ridge))).sum())
+        self.assertLess(df, len(y) - 1.0, 'GCV selected an interpolating lambda={}'.format(float(head.ridge)))
+
     def test_gcv_is_order_invariant_and_default(self):
         xa, ya = blobs(30, [0, 1], 12, seed=1)
         xb, yb = blobs(30, [2, 3], 12, seed=2)
@@ -419,6 +451,28 @@ class TestRepoIntegration(unittest.TestCase):
             self.skipTest('training dependencies not importable: {}'.format(e))
         import inspect
         self.assertIn("'inflora_kh': InfLoRA_KH", inspect.getsource(factory.get_model))
+
+    def test_dual_gpm_with_installed_numpy(self):
+        """InfLoRA's DualGPM must keep numpy bases (numpy>=2 returns tensors if given tensors)."""
+        try:
+            from methods.inflora import InfLoRA
+        except Exception as e:  # pragma: no cover - environment dependent
+            self.skipTest('training dependencies not importable: {}'.format(e))
+        from types import SimpleNamespace
+        rng = np.random.RandomState(0)
+        state = SimpleNamespace(lamb=0.95, lame=1.0, total_sessions=3, feature_list=[], project_type=[])
+        for t in range(3):
+            state._cur_task = t
+            mats = []
+            for _ in range(2):  # two "layers"
+                x = rng.randn(16, 200) * np.linspace(3, 0.1, 16)[:, None]
+                mats.append(x @ x.T / 200)
+            InfLoRA.update_DualGPM(state, mats)
+            for f in state.feature_list:
+                self.assertIsInstance(f, np.ndarray)
+                Uf = torch.Tensor(np.dot(f, f.transpose()))  # what InfLoRA._train does next
+                self.assertEqual(tuple(Uf.shape), (16, 16))
+                self.assertTrue(np.allclose(f.T @ f, np.eye(f.shape[1]), atol=1e-6))
 
 
 if __name__ == '__main__':

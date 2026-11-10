@@ -315,23 +315,29 @@ class AnalyticKernelHead(nn.Module):
     def gcv_scores(self) -> Dict[float, float]:
         """Generalized cross-validation for multi-output ridge, from the running sums only.
 
-        With G = V diag(e) V^T, P = V^T Q, p_i = ||P_i||^2, n samples and one-hot targets
-        (so ||Y||_F^2 = n):
-            RSS(l) = n - 2 sum_i p_i/(e_i+l) + sum_i e_i p_i/(e_i+l)^2   (= ||Y - H W_l||_F^2)
-            df(l)  = sum_i e_i/(e_i+l)                                   (= tr of the hat matrix)
-            GCV(l) = (RSS/n) / (1 - df/n)^2
+        GCV(l) = n * RSS(l) / (n - df(l))^2, with one-hot targets (||Y||_F^2 = n).
+        With G = V diag(e) V^T, P = V^T Q and q_i = ||P_i||^2 / e_i (= energy of Y along the
+        i-th singular direction of the lifted data), over the r numerically nonzero e_i:
+            RSS(l)    = max(0, n - sum_i q_i) + sum_i q_i (l / (e_i + l))^2
+            n - df(l) = (n - r) + sum_i l / (e_i + l)
+        This is exact algebra, written so that no large terms cancel. That matters when
+        D > n (few samples so far): G then has D - n zero eigenvalues, and round-off on
+        them would otherwise make df > n and let GCV pick a meaningless tiny lambda.
         """
         n = float(self.n_seen.item())
         evals, evecs = torch.linalg.eigh(self.G)
-        evals = evals.clamp_min(0)
-        p = ((evecs.t() @ self.Q) ** 2).sum(dim=1)
+        tol = evals.max().clamp_min(0) * max(self.G.shape[0], n) * torch.finfo(self.dtype).eps
+        keep = evals > tol
+        e = evals[keep]
+        q = ((evecs[:, keep].t() @ self.Q) ** 2).sum(dim=1) / e
+        rank = min(float(keep.sum().item()), n)
+        ls_residual = max(0.0, n - float(q.sum()))  # ||(I - P_H) Y||^2, >= 0
         scores = {}
         for lam in self.ridge_grid:
-            d = evals + lam
-            rss = n - 2 * (p / d).sum() + (evals * p / d ** 2).sum()
-            df = (evals / d).sum()
-            denom = (1 - df / n) ** 2
-            scores[lam] = float(rss / n / denom) if denom > 1e-12 else float('inf')
+            shrink = lam / (e + lam)
+            rss = ls_residual + float((q * shrink ** 2).sum())
+            resid_df = (n - rank) + float(shrink.sum())
+            scores[lam] = n * rss / resid_df ** 2 if resid_df > 0 else float('inf')
         return scores
 
     @torch.no_grad()

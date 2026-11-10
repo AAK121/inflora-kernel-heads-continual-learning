@@ -1,0 +1,62 @@
+# Dependencies for running InfLoRA + the kernel classifier head (branch kernel_head).
+#
+# The repo is run from its root (python main.py ..., python tools/...), not imported
+# as an installed package, so this file only declares dependencies.
+#
+# Install with uv (picks torch/torchvision from the PyTorch CUDA 13.0 index below):
+#     uv sync --extra test
+#     uv run python -m pytest tests -v
+#
+# Install with pip into an existing env (Python >= 3.10):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+#     pip install -e ".[test]"
+#
+# Tested together (CPU): torch 2.14.1, torchvision 0.29.2, timm 0.6.7 / 0.6.13,
+# numpy 2.4.2, Python 3.11.5.
+# timm MUST stay on 0.6.x: timm 1.x breaks models/sinet_inflora.py
+# ("'PretrainedCfg' object is not subscriptable").
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inflora-kernel-head"
+version = "0.1.0"
+description = "InfLoRA continual learning with an analytic kernel classifier head"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.9",            # first releases with CUDA 13.0 wheels
+    "torchvision>=0.24",     # matches torch>=2.9
+    "timm==0.6.13",          # pinned: 1.x changes the pretrained-cfg API used by the ViT code
+    "numpy",
+    "scipy",
+    "scikit-learn",          # KMeans in methods/inflora.py
+    "tqdm",
+    "pyyaml",
+    "pillow",
+    "ipdb",                  # imported at module level by main.py, utils/data.py, methods/inflora.py
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+# Flat layout with several top-level folders: declare no packages, so
+# `pip install -e .` installs the dependencies only.
+[tool.setuptools]
+packages = []
+py-modules = []
+
+# uv: take torch and torchvision from the PyTorch CUDA 13.0 wheel index.
+# If the driver needs a CUDA 12.x build instead, change "cu130" (e.g. to "cu128").
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130" }]
+torchvision = [{ index = "pytorch-cu130" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
