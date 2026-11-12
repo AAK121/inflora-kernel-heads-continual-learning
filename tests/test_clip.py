@@ -158,6 +158,15 @@ class TestClipTokenizer(unittest.TestCase):
         tokens = clip_lib.tokenize(['a photo of a goldfish.', 'a sketch of a great white shark.'])
         self.assertEqual(tuple(tokens.shape), (2, 77))
 
+    def test_preprocess_is_picklable(self):
+        # DataLoader workers pickle the dataset (and its transform) under 'forkserver'/'spawn'.
+        import pickle
+        try:
+            from models.clip import clip as clip_lib
+        except Exception as e:  # pragma: no cover - environment dependent
+            self.skipTest('CLIP code not importable (needs ftfy, regex): {}'.format(e))
+        pickle.dumps(clip_lib._transform(224))
+
 
 if __name__ == '__main__':
     unittest.main()
