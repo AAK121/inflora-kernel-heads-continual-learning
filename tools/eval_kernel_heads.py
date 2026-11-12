@@ -104,11 +104,11 @@ def run_sweep(caches, heads, device=None, only=None):
     return results
 
 
-def format_table(results):
+def format_table(results, baseline_label='InfLoRA (concat heads)'):
     base = results['baseline']
     lines = ['{:<28} {:>14} {:>8} {:>9}'.format('head', 'final', 'avg', 'task-id'),
              '{:<28} {:>8.2f} +- {:<4.2f} {:>8.2f} {:>9}'.format(
-                 'InfLoRA (concat heads)', base['final_mean'], base['final_std'], base['avg_mean'], '-')]
+                 baseline_label, base['final_mean'], base['final_std'], base['avg_mean'], '-')]
     ok = [(n, r['summary']) for n, r in results['heads'].items() if 'summary' in r]
     for name, s in sorted(ok, key=lambda r: -r[1]['final_mean']):
         lines.append('{:<28} {:>8.2f} +- {:<4.2f} {:>8.2f} {:>9.4f}'.format(

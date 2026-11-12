@@ -36,6 +36,8 @@ dependencies = [
     "pyyaml",
     "pillow",
     "ipdb",                  # imported at module level by main.py, utils/data.py, methods/inflora.py
+    "ftfy",                  # CLIP tokenizer (models/clip/simple_tokenizer.py), used by clip/
+    "regex",                 # CLIP tokenizer
 ]
 
 [project.optional-dependencies]

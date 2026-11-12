@@ -1,0 +1,9 @@
+[
+    {"name": "linear_centerl2",        "map": "linear", "input_norm": "center_l2", "text_fusion": 0},
+    {"name": "relu10k_centerl2",       "map": "relu", "dim": 10000, "input_norm": "center_l2", "text_fusion": 0},
+    {"name": "rbf5k_centerl2_m1",      "map": "rbf", "dim": 5000, "input_norm": "center_l2", "bandwidth_mult": 1.0, "text_fusion": 0},
+    {"name": "linear_centerl2+text",   "map": "linear", "input_norm": "center_l2", "text_fusion": "auto"},
+    {"name": "relu10k_centerl2+text",  "map": "relu", "dim": 10000, "input_norm": "center_l2", "text_fusion": "auto"},
+    {"name": "rbf5k_centerl2_m1+text", "map": "rbf", "dim": 5000, "input_norm": "center_l2", "bandwidth_mult": 1.0, "text_fusion": "auto"},
+    {"name": "relu10k_centerl2+text50","map": "relu", "dim": 10000, "input_norm": "center_l2", "text_fusion": 0.5}
+]
