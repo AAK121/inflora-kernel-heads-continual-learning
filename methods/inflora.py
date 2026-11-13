@@ -126,6 +126,7 @@ class InfLoRA(BaseLearner):
                         U, S, V = torch.linalg.svd(cur_matrix)
                         module.lora_A_k[self._cur_task].weight.data.copy_(U[:,:module.rank].T/math.sqrt(3))
                         module.lora_A_v[self._cur_task].weight.data.copy_(U[:,:module.rank].T/math.sqrt(3))
+                        module.calibrate_psi(self._cur_task)
                         module.cur_matrix.zero_()
                         module.n_cur_matrix = 0
             else:
@@ -153,6 +154,7 @@ class InfLoRA(BaseLearner):
                         cU, cS, cV = torch.linalg.svd(cur_matrix, full_matrices=False)
                         module.lora_A_k[self._cur_task].weight.data.copy_(cU[:,:module.rank].T/math.sqrt(3))
                         module.lora_A_v[self._cur_task].weight.data.copy_(cU[:,:module.rank].T/math.sqrt(3))
+                        module.calibrate_psi(self._cur_task)  # uses the unprojected cur_matrix: u = B_t x on raw inputs
                         module.cur_matrix.zero_()
                         module.n_cur_matrix = 0
                         kk += 1

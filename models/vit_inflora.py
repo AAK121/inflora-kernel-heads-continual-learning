@@ -28,6 +28,8 @@ from timm.models.helpers import build_model_with_cfg, resolve_pretrained_cfg, na
 from timm.models.layers import PatchEmbed, Mlp, DropPath, trunc_normal_, lecun_normal_
 from timm.models.registry import register_model
 
+from models.kernel_adapter import TaskFeatureMap
+
 _logger = logging.getLogger(__name__)
 
 
@@ -173,7 +175,7 @@ default_cfgs = {
 
 
 class Attention_LoRA(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., r=64, n_tasks=10):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., r=64, n_tasks=10, psi=None):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -188,10 +190,18 @@ class Attention_LoRA(nn.Module):
         self.attention_map = None
         self.rank = r
 
+        # psi (models/kernel_adapter.py): delta_t(x) = lora_B[t](psi_t(lora_A[t](x))); None is plain InfLoRA
+        self.psi_k = self.psi_v = None
+        feat = r
+        if psi is not None:
+            self.psi_k = TaskFeatureMap(psi['kind'], r, psi['m'], n_tasks, psi['sigma_mult'])
+            self.psi_v = TaskFeatureMap(psi['kind'], r, psi['m'], n_tasks, psi['sigma_mult'])
+            feat = psi['m']
+
         self.lora_A_k = nn.ModuleList([nn.Linear(dim, r, bias=False) for _ in range(n_tasks)])
-        self.lora_B_k = nn.ModuleList([nn.Linear(r, dim, bias=False) for _ in range(n_tasks)])
+        self.lora_B_k = nn.ModuleList([nn.Linear(feat, dim, bias=False) for _ in range(n_tasks)])
         self.lora_A_v = nn.ModuleList([nn.Linear(dim, r, bias=False) for _ in range(n_tasks)])
-        self.lora_B_v = nn.ModuleList([nn.Linear(r, dim, bias=False) for _ in range(n_tasks)])
+        self.lora_B_v = nn.ModuleList([nn.Linear(feat, dim, bias=False) for _ in range(n_tasks)])
         self.rank = r
 
         self.matrix = torch.zeros(dim ,dim)
@@ -207,6 +217,8 @@ class Attention_LoRA(nn.Module):
             nn.init.zeros_(self.lora_B_v[t].weight)
 
     def init_param_ada(self, t, r):
+        if self.psi_k is not None:
+            raise NotImplementedError('per-task rank is not supported with psi')
         self.lora_A_k[t] = nn.Linear(self.dim, r, bias=False).to(self.qkv.weight.device)
         self.lora_B_k[t] = nn.Linear(r, self.dim, bias=False).to(self.qkv.weight.device)
         self.lora_A_v[t] = nn.Linear(self.dim, r, bias=False).to(self.qkv.weight.device)
@@ -242,7 +254,10 @@ class Attention_LoRA(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
         # insert lora
-        if task > -0.5:
+        if task > -0.5 and self.psi_k is not None:
+            k = k + self._psi_delta(x, task, self.lora_A_k, self.lora_B_k, self.psi_k).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+            v = v + self._psi_delta(x, task, self.lora_A_v, self.lora_B_v, self.psi_v).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        elif task > -0.5:
             weight_k = torch.stack([torch.mm(self.lora_B_k[t].weight, self.lora_A_k[t].weight) for t in range(task+1)], dim=0).sum(dim=0)
             weight_v = torch.stack([torch.mm(self.lora_B_v[t].weight, self.lora_A_v[t].weight) for t in range(task+1)], dim=0).sum(dim=0)
             k = k + F.linear(x, weight_k).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
@@ -261,12 +276,36 @@ class Attention_LoRA(nn.Module):
         x = self.proj_drop(x)
         return x
 
+    def _psi_delta(self, x, task, lora_A, lora_B, psi):
+        # The (B, N, T, m) features of all tasks would be kept for backward in every block (~20 GB at
+        # T=20, m=128, batch 128); recompute them in backward instead and keep only x.
+        if torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(self._psi_delta_eager, x, task, lora_A, lora_B, psi, use_reentrant=False)
+        return self._psi_delta_eager(x, task, lora_A, lora_B, psi)
+
+    def _psi_delta_eager(self, x, task, lora_A, lora_B, psi):
+        # all tasks 0..task at once: u (B, N, T, r) -> psi (B, N, T, m) -> sum_t lora_B[t] psi_t
+        n = task + 1
+        u = F.linear(x, torch.cat([lora_A[t].weight for t in range(n)], dim=0))
+        feats = psi(u.unflatten(-1, (n, self.rank)))
+        return F.linear(feats.flatten(-2), torch.cat([lora_B[t].weight for t in range(n)], dim=1))
+
+    def calibrate_psi(self, task):
+        # call after lora_A[task] is set and while cur_matrix still holds the task's input second moment
+        if self.psi_k is not None:
+            self.psi_k.calibrate(task, self.lora_A_k[task].weight, self.cur_matrix)
+            self.psi_v.calibrate(task, self.lora_A_v[task].weight, self.cur_matrix)
+
     def get_matrix(self, task):
+        if self.psi_k is not None:
+            raise NotImplementedError('with psi the adapter is not a single matrix')
         matrix_k = torch.mm(self.lora_B_k[task].weight, self.lora_A_k[task].weight)
         matrix_v = torch.mm(self.lora_B_v[task].weight, self.lora_A_v[task].weight)
         return matrix_k, matrix_v
     
     def get_pre_matrix(self, task):
+        if self.psi_k is not None:
+            raise NotImplementedError('with psi the adapter is not a single matrix')
         with torch.no_grad():
             weight_k = torch.stack([torch.mm(self.lora_B_k[t].weight, self.lora_A_k[t].weight) for t in range(task)], dim=0).sum(dim=0)
             weight_v = torch.stack([torch.mm(self.lora_B_v[t].weight, self.lora_A_v[t].weight) for t in range(task)], dim=0).sum(dim=0)
@@ -286,10 +325,10 @@ class Block(nn.Module):
 
     def __init__(
             self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., init_values=None,
-            drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, n_tasks=10, r=64):
+            drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, n_tasks=10, r=64, psi=None):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention_LoRA(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, n_tasks=n_tasks, r=r)
+        self.attn = Attention_LoRA(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop, n_tasks=n_tasks, r=r, psi=psi)
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -357,7 +396,7 @@ class VisionTransformer(nn.Module):
             self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, global_pool='token',
             embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None,
             drop_rate=0., attn_drop_rate=0., drop_path_rate=0., weight_init='', init_values=None,
-            embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block, n_tasks=10, rank=64):
+            embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block, n_tasks=10, rank=64, psi=None):
         """
         Args:
             img_size (int, tuple): input image size
@@ -405,7 +444,7 @@ class VisionTransformer(nn.Module):
         self.blocks = nn.Sequential(*[
             block_fn(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, init_values=init_values,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,n_tasks=n_tasks,r=rank)
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, act_layer=act_layer,n_tasks=n_tasks,r=rank,psi=psi)
             for i in range(depth)])
         use_fc_norm = self.global_pool == 'avg'
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()

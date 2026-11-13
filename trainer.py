@@ -8,10 +8,13 @@ import torch
 from utils import factory
 from utils.data_manager import DataManager
 from utils.toolkit import count_parameters
+from models.kernel_adapter import psi_config, psi_tag
 
 
 def train(args):
     seed_list = copy.deepcopy(args['seed'])
+    if not isinstance(seed_list, list):
+        seed_list = [seed_list]
     device = copy.deepcopy(args['device'])
     device = device.split(',')
 
@@ -28,8 +31,11 @@ def train(args):
 
 
 def _train(args):
+    if psi_config(args) is not None and args['model_name'] != 'InfLoRA':
+        raise ValueError('psi is only wired into InfLoRA (methods/inflora.py calibrates it)')
     if args['model_name'] in ['InfLoRA', 'InfLoRA_domain', 'InfLoRAb5_domain', 'InfLoRAb5', 'InfLoRA_CA', 'InfLoRA_CA1']:
         logdir = 'logs/{}/{}_{}_{}/{}/{}/{}/{}_{}-{}'.format(args['dataset'], args['init_cls'], args['increment'], args['net_type'], args['model_name'], args['optim'], args['rank'], args['lamb'], args['lame'], args['lrate'])
+        logdir += psi_tag(args)  # empty for plain InfLoRA, so baseline paths are unchanged
     else:
         logdir = 'logs/{}/{}_{}_{}/{}/{}'.format(args['dataset'], args['init_cls'], args['increment'], args['net_type'], args['model_name'], args['optim'])
 

@@ -4,18 +4,19 @@ import copy
 
 from models.vit_inflora import VisionTransformer, PatchEmbed, Block,resolve_pretrained_cfg, build_model_with_cfg, checkpoint_filter_fn
 from models.zoo import CodaPrompt
+from models.kernel_adapter import psi_config
 
 class ViT_lora_co(VisionTransformer):
     def __init__(
             self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, global_pool='token',
             embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True, representation_size=None,
             drop_rate=0., attn_drop_rate=0., drop_path_rate=0., weight_init='', init_values=None,
-            embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block, n_tasks=10, rank=64):
+            embed_layer=PatchEmbed, norm_layer=None, act_layer=None, block_fn=Block, n_tasks=10, rank=64, psi=None):
 
         super().__init__(img_size=img_size, patch_size=patch_size, in_chans=in_chans, num_classes=num_classes, global_pool=global_pool,
             embed_dim=embed_dim, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, representation_size=representation_size,
             drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, drop_path_rate=drop_path_rate, weight_init=weight_init, init_values=init_values,
-            embed_layer=embed_layer, norm_layer=norm_layer, act_layer=act_layer, block_fn=block_fn, n_tasks=n_tasks, rank=rank)
+            embed_layer=embed_layer, norm_layer=norm_layer, act_layer=act_layer, block_fn=block_fn, n_tasks=n_tasks, rank=rank, psi=psi)
 
 
     def forward(self, x, task_id, register_blk=-1, get_feat=False, get_cur_feat=False):
@@ -64,7 +65,8 @@ class SiNet(nn.Module):
     def __init__(self, args):
         super(SiNet, self).__init__()
 
-        model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, n_tasks=args["total_sessions"], rank=args["rank"])
+        model_kwargs = dict(patch_size=16, embed_dim=768, depth=12, num_heads=12, n_tasks=args["total_sessions"], rank=args["rank"],
+                            psi=psi_config(args))
         self.image_encoder =_create_vision_transformer('vit_base_patch16_224_in21k', pretrained=True, **model_kwargs)
         # print(self.image_encoder)
         # exit()
