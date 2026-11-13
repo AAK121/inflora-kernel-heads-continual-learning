@@ -1,0 +1,677 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools,bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+% ---------- theorem environments ----------
+\theoremstyle{plain}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}[proposition]{Lemma}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+% ---------- macros ----------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\M}{\mathcal{M}}
+\newcommand{\Lk}{\mathcal{L}_{\mathrm{ker}}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\rank}{\operatorname{rank}}
+\newcommand{\spn}{\operatorname{span}}
+\newcommand{\range}{\operatorname{range}}
+\newcommand{\blkdiag}{\operatorname{blkdiag}}
+\newcommand{\dist}{\operatorname{dist}}
+\newcommand{\topr}{\operatorname{top}_r}
+\newcommand{\x}{\bm{x}}
+\newcommand{\z}{\bm{z}}
+\newcommand{\vu}{\bm{u}}
+\newcommand{\vphi}{\bm{\phi}}
+\newcommand{\vpsi}{\bm{\psi}}
+\newcommand{\vmu}{\bm{\mu}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Kernelized InfLoRA:\\
+Interference-Free Low-Rank Adaptation in a Random-Feature Space\\
+for Long Task Sequences}
+\author{GNR650 Course Project}
+\date{Technical design note --- \today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+InfLoRA~\cite{inflora} adapts a frozen ViT by adding low-rank branches $A_tB_t$ to the key and value projections. The frozen down-projection $B_t$ is chosen orthogonal to a protected subspace $\M_{t-1}$ of old-task inputs, so the update cannot interfere with old tasks. Because the constraint is linear in the input $\x\in\R^{d}$, two things happen as tasks accumulate. The protected subspace grows toward $\R^{d}$. More importantly, new-task inputs increasingly lie inside it, so the directions left for $B_t$ carry little new-task energy. This note gives the full mathematical specification of \emph{Kernelized InfLoRA}, in which $B_t$ acts on a hybrid feature map $\vpsi(\x)=[\x;\alpha\vphi(\z(\x))]$. Here $\vphi$ is a frozen orthogonal random Fourier feature map of a normalized input. We
+(i) restate InfLoRA exactly as implemented in this codebase;
+(ii) define the lifted adapter, its block-separable protected subspace, and the per-block DualGPM update;
+(iii) prove which interference guarantees survive, quantify what the kernel can and cannot add (locality, independence of $D$, high-dimensional linearization), and derive held-out diagnostics;
+(iv) give the complexity, a go/no-go diagnostic protocol, the long-sequence experimental plan, and a file-by-file implementation plan.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+%=====================================================================
+\section{Notation}
+%=====================================================================
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Symbol & Meaning \\
+\midrule
+$d=768$ & ViT-B/16 embedding width \\
+$T$, $t\in\{1,\dots,T\}$ & number of tasks, task index (the code uses $t-1$, \code{self.\_cur\_task}) \\
+$\ell\in\{1,\dots,12\}$ & transformer block index; layer superscripts are dropped when unambiguous \\
+$\x\in\R^{d}$ & one token's input to the attention block (output of \code{norm1}) \\
+$X_t\in\R^{d\times N_t}$ & all tokens of all training images of task $t$ (one column per token) \\
+$W_k,W_v\in\R^{d\times d}$ & frozen pretrained key/value projections \\
+$r$ & LoRA rank (\code{rank} in the configs, $r=10$) \\
+$B_t\in\R^{r\times p}$ & frozen down-projection of task $t$ (\code{lora\_A\_k[t]}, \code{lora\_A\_v[t]}) \\
+$A^k_t,A^v_t\in\R^{d\times r}$ & trainable up-projections (\code{lora\_B\_k[t]}, \code{lora\_B\_v[t]}) \\
+$\M_t$, $P_t$ & protected subspace after task $t$ and its orthogonal projector \\
+$D$ & random-feature dimension (even) \\
+$p$ & adapter input dimension: $p=d$ (InfLoRA) or $p=d+D$ (kernel blocks) \\
+$\vphi:\R^{q}\to\R^{D}$ & frozen random Fourier feature map \\
+$\vpsi:\R^{d}\to\R^{p}$ & hybrid lift $\vpsi(\x)=[\x;\alpha\vphi(\z(\x))]$ \\
+$\Lk$ & set of blocks that use the kernel lift (default: the last 6) \\
+$\|\cdot\|_F$ & Frobenius norm; $\topr(\cdot)$ = top-$r$ left singular vectors \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=====================================================================
+\section{InfLoRA exactly as implemented}\label{sec:inflora}
+%=====================================================================
+
+\subsection{The adapter}
+In every block (\code{Attention\_LoRA.forward}, \code{models/vit\_inflora.py}), the query projection is unchanged. Keys and values receive the sum of all task branches up to the current task $t$:
+\begin{equation}\label{eq:adapter}
+\bm k(\x) = W_k\x + \sum_{s\le t} A^k_s B_s\,\x,\qquad
+\bm v(\x) = W_v\x + \sum_{s\le t} A^v_s B_s\,\x .
+\end{equation}
+The \emph{same} $B_s$ is used for keys and values: the code copies the same singular vectors into \code{lora\_A\_k[s]} and \code{lora\_A\_v[s]}. All $A_s$ are zero-initialized, and when task $t$ is trained only $A^k_t, A^v_t$ and the task-$t$ classifier head receive gradients. Since $\Delta W^k_t=\sum_{s\le t}A^k_sB_s\in\R^{d\times d}$ is a plain matrix, it can be merged into $W_k$ at inference time.
+
+\subsection{Input second-moment matrix}
+Before training task $t$, one forward pass over the task-$t$ training set accumulates the \emph{uncentered} second moment of the block inputs over all tokens:
+\begin{equation}\label{eq:secondmoment}
+C_t = \frac{1}{N_t}\sum_{n=1}^{N_t}\x_n\x_n^{\top}= \frac{1}{N_t}X_tX_t^{\top}\in\R^{d\times d}.
+\end{equation}
+This is \code{cur\_matrix}. The forward pass uses the current network, in which $A_t=0$.
+
+\subsection{Choice of $B_t$}
+Let $P_{t-1}$ be the projector onto $\M_{t-1}$, with $P_0=0$. The code forms
+\begin{equation}\label{eq:Bt}
+\widehat C_t = (I-P_{t-1})\,C_t,\qquad
+B_t = \tfrac{1}{\sqrt 3}\,\topr\big(\widehat C_t\big)^{\top}\in\R^{r\times d},
+\end{equation}
+where $\topr(\widehat C_t)\in\R^{d\times r}$ holds the first $r$ left singular vectors. In ``retain'' mode the code stores an orthonormal basis $V$ of $\M_{t-1}^{\perp}$ and computes $VV^{\top}C_t$, which is the same matrix because $VV^{\top}=I-P_{t-1}$. The left singular vectors of $\widehat C_t$ equal the eigenvectors of $(I-P)C_t^2(I-P)$, so $B_t$ selects the \emph{free} directions with the largest (squared) new-task second moment.
+
+\begin{proposition}[Interference-freeness of linear InfLoRA]\label{prop:linear}
+Assume $\widehat C_t$ has at least $r$ nonzero singular values. Then $B_tP_{t-1}=0$, and for every $\x$:
+\[
+B_t\x = B_t(I-P_{t-1})\x,\qquad\text{so}\qquad
+\|A_tB_t\x\|\le \|A_tB_t\|_2\,\big\|(I-P_{t-1})\x\big\| .
+\]
+In particular $A_tB_t\x=0$ for every $\x\in\M_{t-1}$, whatever $A_t$ is trained to.
+\end{proposition}
+\begin{proof}
+Left singular vectors with nonzero singular value lie in $\range(\widehat C_t)\subseteq\range(I-P_{t-1})$. Hence each row $\bm b$ of $B_t$ satisfies $P_{t-1}\bm b=0$, i.e.\ $B_tP_{t-1}=0$. The rest follows from $\x=P_{t-1}\x+(I-P_{t-1})\x$.
+\end{proof}
+
+The guarantee is per layer. If it holds in blocks $1,\dots,\ell-1$ for old-task inputs, those inputs reach block $\ell$ unchanged, and by induction the whole network's features of old inputs are preserved. In practice this is approximate, because $\M$ keeps only an $\varepsilon_t$ fraction of the energy.
+
+\subsection{DualGPM update of the protected subspace}\label{sec:dualgpm}
+After training task $t$, $C_t$ is recomputed with the trained adapters, and $\M$ is updated by \code{update\_DualGPM}. The energy threshold grows linearly over tasks:
+\begin{equation}\label{eq:threshold}
+\varepsilon_t = \varepsilon_b + (\varepsilon_e-\varepsilon_b)\,\frac{t-1}{T},
+\end{equation}
+where $(\varepsilon_b,\varepsilon_e)$ is (\code{lamb},~\code{lame}), for example $(0.95,1.0)$ on CIFAR-100 and $(0.98,1.0)$ on ImageNet-R. Note that the code applies the SVD to the second-moment matrix $C_t$ itself. ``Energy'' therefore means $\|C_t\|_F^2=\sum_i\lambda_i^2$ (squared eigenvalues), not $\tr C_t=\sum_i\lambda_i$.
+
+\paragraph{Remove mode} ($\M$ stored as an orthonormal basis $U\in\R^{p\times m}$).
+Let $\widehat C=(I-UU^{\top})C_t$ with singular values $\hat\lambda_1\ge\hat\lambda_2\ge\cdots$ and left singular vectors $\hat\vu_i$. Starting from
+$a_0 = \big(\|C_t\|_F^2-\|\widehat C\|_F^2\big)/\|C_t\|_F^2$
+(the fraction of energy already explained), the code adds $\hat\vu_1,\hat\vu_2,\dots$ while $a_{k}<\varepsilon_t$, with $a_{k}=a_{k-1}+\hat\lambda_k^2/\|C_t\|_F^2$. It then sets $U\leftarrow[U,\hat\vu_1,\dots,\hat\vu_k]$.
+
+\paragraph{Retain mode} ($\M^{\perp}$ stored as an orthonormal basis $V\in\R^{p\times m'}$).
+Let $\widehat C=VV^{\top}C_t$ and start from $a_0=\|\widehat C\|_F^2/\|C_t\|_F^2$. While $a_{k-1}\ge 1-\varepsilon_t$, the code removes $\hat\vu_k$ from the free space, with $a_k=a_{k-1}-\hat\lambda_k^2/\|C_t\|_F^2$. Finally $V\leftarrow$ the first $m'-k$ left singular vectors of $(I-\hat U_k\hat U_k^{\top})V$.
+
+\paragraph{Switch.} If in remove mode $m>p/2$, the code replaces $U$ by a basis of its complement and switches to retain mode.
+
+\begin{remark}[Latent inconsistency at task 1]\label{rem:bug}
+For the \emph{first} task, if the number of selected directions satisfies $k\ge p/2$, the code stores $U[:,1{:}k]$ (the \emph{protected} directions) but labels it \code{'retain'}, which means ``basis of the free space''. Task~2 would then build $B_2$ \emph{inside} the protected space. With $p=d$ and threshold $0.95$ this branch is apparently never reached, but with $p=d+D$ and a flat kernel spectrum it can be. The fix is to store the complement $U[:,k{+}1{:}p]$ in this branch. Our implementation runs DualGPM per block (Section~\ref{sec:blockgpm}) and includes this fix.
+\end{remark}
+
+%=====================================================================
+\section{Quantifying saturation}\label{sec:saturation}
+%=====================================================================
+
+Two different things can run out:
+\begin{definition}[Free dimension and novelty]
+The \emph{free dimension} after task $t-1$ is $f_{t}=p-\dim\M_{t-1}$. The \emph{novelty} of task $t$ is the fraction of its input energy outside the protected subspace:
+\begin{equation}\label{eq:rho}
+\rho_t = \frac{\tr\big((I-P_{t-1})C_t\big)}{\tr(C_t)}
+       = \frac{\sum_n\|(I-P_{t-1})\x_n\|^2}{\sum_n\|\x_n\|^2}\in[0,1].
+\end{equation}
+\end{definition}
+
+What $A_t$ can actually exploit is the energy of \emph{unseen} new-task inputs that falls in the row space of $B_t$. What it must not touch is the energy of unseen old-task inputs that falls in that row space.
+
+\begin{definition}[Held-out signal and interference]\label{def:nu}
+Let $\widetilde B_t=\sqrt3\,B_t$, whose rows are orthonormal. Let $\mathcal V_t$ be held-out (validation or test) tokens of task $t$ and $\mathcal V_{<t}$ held-out tokens of earlier tasks. Define
+\begin{equation}\label{eq:nu}
+\nu_t=\frac{\sum_{\x\in\mathcal V_t}\|\widetilde B_t\vpsi(\x)\|^2}{\sum_{\x\in\mathcal V_t}\|\vpsi(\x)\|^2},
+\qquad
+\iota_t=\frac{\sum_{\x\in\mathcal V_{<t}}\|\widetilde B_t\vpsi(\x)\|^2}{\sum_{\x\in\mathcal V_{<t}}\|\vpsi(\x)\|^2},
+\end{equation}
+where $\vpsi(\x)=\x$ for linear InfLoRA. Call $\nu_t$ the \emph{usable signal} and $\iota_t$ the \emph{leakage}.
+\end{definition}
+
+Saturation in the sense that matters is \emph{$\nu_t$ falling with $t$ while $\iota_t$ stays small}, and this can happen long before $f_t$ reaches $0$. The following lemma shows why no \emph{linear} remedy, of any rank, can fix it.
+
+\begin{lemma}[Linear ceiling]\label{lem:ceiling}
+Let $\Delta\in\R^{d\times d}$ be any matrix, of any rank, with $\Delta\x=0$ for all $\x\in\M$. Then for every $\x$,
+$\|\Delta\x\|\le\|\Delta\|_2\,\|(I-P_\M)\x\|$. Consequently, summed over the new task's tokens,
+$\sum_n\|\Delta\x_n\|^2\le\|\Delta\|_2^2\,\rho_t\sum_n\|\x_n\|^2$.
+\end{lemma}
+\begin{proof}
+$\Delta P_\M=0$ gives $\Delta\x=\Delta(I-P_\M)\x$.
+\end{proof}
+
+So high-rank adapters (MoRA, HiRA, KronA, RandLoRA, \dots) that are linear in $\x$ and respect the constraint are all bounded by the same novelty $\rho_t$. To escape the bound, the constraint itself must live in a different space. That is the purpose of the lift $\vpsi$.
+
+%=====================================================================
+\section{The kernel feature map}\label{sec:features}
+%=====================================================================
+
+\subsection{Normalized input}
+For a kernel block $\ell\in\Lk$, the vector that gets lifted is
+\begin{equation}\label{eq:z}
+\z(\x)=\frac{S(\x-\vmu)}{\|S(\x-\vmu)\|}\in\mathbb S^{q-1},
+\end{equation}
+where $\vmu\in\R^{d}$ is the token mean and $S\in\R^{q\times d}$ is a fixed pre-projection. The default is $S=I_d$, $q=d$. As an ablation, $S$ is the top-$q$ principal directions with $q\in\{64,128,256\}$. Both are estimated once on task-1 training tokens and then frozen.
+
+Three reasons for this choice:
+\begin{itemize}[nosep]
+\item Centering removes the large common mean of LayerNorm outputs. Without it, all pairwise cosines are close to one and the kernel collapses.
+\item Normalization removes the influence of high-norm outlier tokens.
+\item Normalization makes $\|\z-\z'\|^2=2(1-\z^{\top}\z')$, so the kernel depends only on cosine similarity.
+\end{itemize}
+
+\subsection{Orthogonal random Fourier features}
+Let $D$ be even and $D_2=D/2$. Build $\Omega\in\R^{D_2\times q}$ by stacking $\lceil D_2/q\rceil$ blocks $\Omega_j=\operatorname{diag}(\bm s_j)\,Q_j$ and truncating to $D_2$ rows. Each $Q_j\in\R^{q\times q}$ is a uniformly random orthogonal matrix (the QR factor of a Gaussian matrix, with signs fixed), and $\bm s_j$ has i.i.d.\ $\chi_q$ entries. This is the orthogonal random features (ORF) construction~\cite{orf}. Every row $\bm\omega_i$ of $\Omega$ is then marginally $\mathcal N(0,I_q)$. Define
+\begin{equation}\label{eq:rff}
+\vphi(\z)=\frac{1}{\sqrt{D_2}}
+\begin{bmatrix}\cos(\Omega\z/\sigma)\\ \sin(\Omega\z/\sigma)\end{bmatrix}\in\R^{D}.
+\end{equation}
+
+\begin{lemma}[Properties of $\vphi$]\label{lem:rff}
+\begin{enumerate}[label=(\alph*),nosep]
+\item $\|\vphi(\z)\|=1$ exactly, for every $\z$.
+\item $\vphi(\z)^{\top}\vphi(\z')=\frac1{D_2}\sum_{i=1}^{D_2}\cos\!\big(\bm\omega_i^{\top}(\z-\z')/\sigma\big)$.
+\item $\E\big[\vphi(\z)^{\top}\vphi(\z')\big]=k_\sigma(\z,\z')=\exp\!\big(-\|\z-\z'\|^2/(2\sigma^2)\big)=\exp\!\big(-(1-\z^{\top}\z')/\sigma^2\big)$.
+\end{enumerate}
+\end{lemma}
+\begin{proof}
+(a) $\sum_i(\cos^2+\sin^2)/D_2=1$. (b) Use $\cos a\cos b+\sin a\sin b=\cos(a-b)$. (c) For $\bm\omega\sim\mathcal N(0,I)$, $\E\cos(\bm\omega^{\top}\bm\delta)=e^{-\|\bm\delta\|^2/2}$ (the characteristic function of a Gaussian, i.e.\ Bochner's theorem~\cite{rff}). Each row of the ORF matrix is marginally Gaussian, so the estimator is unbiased; orthogonality only reduces its variance~\cite{orf}.
+\end{proof}
+
+\subsection{Hybrid lift}
+\begin{equation}\label{eq:psi}
+\boxed{\;\vpsi(\x)=\begin{bmatrix}\x\\ \alpha\,\vphi(\z(\x))\end{bmatrix}\in\R^{p},\qquad p=d+D\;}
+\end{equation}
+The linear block keeps everything InfLoRA can do; InfLoRA is the special case $\alpha=0$. The kernel block adds directions indexed by \emph{location} on the sphere. In blocks $\ell\notin\Lk$, $\vpsi(\x)=\x$.
+
+\subsection{Calibration (task 1 only, then frozen)}\label{sec:calib}
+For each $\ell\in\Lk$, using task-1 training tokens only:
+\begin{align}
+\vmu &= \tfrac1{N_1}\textstyle\sum_n\x_n, \label{eq:mu}\\
+\sigma &= c_\sigma\cdot\operatorname{median}_{i\ne j}\|\z_i-\z_j\| \quad\text{(on a random subsample of $\approx 10^4$ tokens)},\label{eq:sigma}\\
+\alpha &= \sqrt{\gamma\cdot\tfrac1{N_1}\textstyle\sum_n\|\x_n\|^2}\quad\Rightarrow\quad \E\|\alpha\vphi\|^2=\gamma\,\E\|\x\|^2 .\label{eq:alpha}
+\end{align}
+The random seed of $\Omega$ is fixed per layer. Here $c_\sigma$ is the bandwidth multiplier and $\gamma$ the energy ratio of the kernel block to the linear block.
+
+\begin{remark}[Why $\vphi$ must be frozen]
+$\M^{\varphi}_t$ and every stored $B_s$ are expressed in $\vphi$-coordinates. If $\vphi$ changed after task $s$ (redrawing $\Omega$, updating $\vmu$, $\sigma$ or $S$, or re-centering per task), the stored bases and the summed adapters $\sum_sA_sB_s$ would refer to a different space, and Proposition~\ref{prop:hybrid} would no longer apply to old tasks. For the same reason we do \emph{not} lift the residual $(I-P_{t-1})\x$, even though it is attractive: $P_{t-1}$ changes with $t$.
+\end{remark}
+
+%=====================================================================
+\section{Kernelized InfLoRA}\label{sec:method}
+%=====================================================================
+
+\subsection{Adapter}
+For $\ell\in\Lk$, Eq.~\eqref{eq:adapter} becomes
+\begin{equation}\label{eq:kadapter}
+\bm k(\x)=W_k\x+\sum_{s\le t}A^k_sB_s\,\vpsi(\x),\qquad B_s=\big[B_s^{x}\;\;B_s^{\varphi}\big],\; B_s^{x}\in\R^{r\times d},\;B_s^{\varphi}\in\R^{r\times D},
+\end{equation}
+and likewise for $\bm v$. Expanding,
+\begin{equation}\label{eq:merge}
+\bm k(\x)=\underbrace{\Big(W_k+\sum_sA^k_sB^x_s\Big)}_{\text{mergeable into }W_k}\x
++\alpha\underbrace{\Big(\sum_sA^k_sB^\varphi_s\Big)}_{=:\,\Delta^{\varphi}_k\in\R^{d\times D}}\vphi(\z(\x)).
+\end{equation}
+At inference the adapter is therefore one $d\times D$ matrix per projection, plus one evaluation of $\vphi$ per token, which is shared by $\bm k$ and $\bm v$. Each output coordinate of the kernel branch, $\bm w^{\top}\vphi(\z)$, is a random-feature approximation of a function in the RKHS of $k_\sigma$. So the adapter adds a nonlinear, location-dependent correction to the keys and values.
+
+\subsection{Lifted second moment}
+\begin{equation}\label{eq:Cpsi}
+C^{\psi}_t=\frac1{N_t}\sum_n\vpsi(\x_n)\vpsi(\x_n)^{\top}=
+\begin{bmatrix}C^{xx}_t & \alpha\,C^{x\varphi}_t\\ \alpha\,C^{\varphi x}_t & \alpha^2 C^{\varphi\varphi}_t\end{bmatrix}\in\R^{p\times p},
+\end{equation}
+with $C^{xx}_t=C_t$ from Eq.~\eqref{eq:secondmoment}, $C^{\varphi\varphi}_t=\frac1{N_t}\sum_n\vphi_n\vphi_n^{\top}$ and $C^{x\varphi}_t=\frac1{N_t}\sum_n\x_n\vphi_n^{\top}$.
+
+\subsection{Block-separable protected subspace}
+We maintain \emph{two} protected subspaces per kernel layer, $\M^x_t\subseteq\R^d$ and $\M^\varphi_t\subseteq\R^D$, and protect their direct sum:
+\begin{equation}\label{eq:blockP}
+\M_t=\M^x_t\oplus\M^\varphi_t,\qquad P_t=\blkdiag\big(P^x_t,\;P^\varphi_t\big).
+\end{equation}
+$B_t$ is chosen exactly as in Eq.~\eqref{eq:Bt}, but in $\R^{p}$:
+\begin{equation}\label{eq:kBt}
+\widehat C^{\psi}_t=(I_p-P_{t-1})\,C^{\psi}_t,\qquad B_t=\tfrac1{\sqrt3}\topr\big(\widehat C^{\psi}_t\big)^{\top}\in\R^{r\times p}.
+\end{equation}
+A single joint SVD decides how the $r$ directions are split between the linear and kernel blocks: the split follows whichever free directions carry the most new-task second moment, and $\gamma$ (through $\alpha$) sets the exchange rate.
+
+\begin{proposition}[Hybrid guarantee]\label{prop:hybrid}
+Under the assumption of Proposition~\ref{prop:linear}, for every input $\x$, with $\z=\z(\x)$:
+\begin{equation}\label{eq:hybridbound}
+B_t\vpsi(\x)=B^x_t(I-P^x_{t-1})\x+\alpha\,B^\varphi_t(I-P^\varphi_{t-1})\vphi(\z).
+\end{equation}
+Hence:
+\begin{enumerate}[label=(\roman*),nosep]
+\item if $\x\in\M^x_{t-1}$ and $\vphi(\z)\in\M^\varphi_{t-1}$, then $A_tB_t\vpsi(\x)=0$ exactly;
+\item if $\x\in\M^x_{t-1}$, the interference is \emph{only} the kernel residual:
+\[
+\|A_tB_t\vpsi(\x)\|\le\alpha\,\|A_t\|_2\|B^\varphi_t\|_2\,\dist\big(\vphi(\z),\M^\varphi_{t-1}\big);
+\]
+\item in general,
+\[
+\|A_tB_t\vpsi(\x)\|\le\|A_tB_t\|_2\Big(\|(I-P^x_{t-1})\x\|^2+\alpha^2\dist^2\big(\vphi(\z),\M^\varphi_{t-1}\big)\Big)^{1/2}.
+\]
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+As in Proposition~\ref{prop:linear}, the rows of $B_t$ lie in $\range(I-P_{t-1})$, so $B_t=B_t(I-P_{t-1})$. Expand with the block-diagonal $P_{t-1}$ and use $\|(I-P^\varphi)\vphi\|=\dist(\vphi,\M^\varphi)$.
+\end{proof}
+
+\begin{remark}[Why block-separable rather than joint]
+DualGPM run on the joint matrix $C^\psi_t$ protects joint directions $[\bm a;\bm b]$. An old input whose linear part lies in the old span, but whose kernel part deviates slightly (for example a shifted test image), would then lose protection \emph{of its linear part as well}. The block-separable choice keeps linear InfLoRA's worst-case guarantee on the linear block. Only the kernel block carries the weaker, local guarantee of Section~\ref{sec:theory}.
+\end{remark}
+
+\subsection{Per-block DualGPM}\label{sec:blockgpm}
+After training task $t$, recompute $C^{xx}_t$ and $C^{\varphi\varphi}_t$ and run the DualGPM of Section~\ref{sec:dualgpm} separately on each block, with the Remark~\ref{rem:bug} fix:
+\begin{itemize}[nosep]
+\item linear block: threshold $\varepsilon^x_t$ from Eq.~\eqref{eq:threshold}, unchanged from InfLoRA;
+\item kernel block: threshold $\varepsilon^\varphi_t$ with its own schedule $(\varepsilon^\varphi_b,\varepsilon^\varphi_e)$, plus a per-task cap $k^\varphi_{\max}$ on the number of added directions.
+\end{itemize}
+The cap is needed because the RFF spectrum has a flat tail (Section~\ref{sec:highdim}). With an energy threshold close to $1$, a flat tail would make $\dim\M^\varphi$ grow toward $\min(N_t,D)$ with directions that do not generalize. Because the code measures energy with \emph{squared} eigenvalues, a flat tail is already down-weighted relative to $\tr$-based energy; the cap is a second safeguard. An alternative criterion is the effective dimension
+$k^\varphi_t=\big\lceil\sum_i\lambda_i/(\lambda_i+\lambda)\big\rceil$ with ridge $\lambda=\eta\,\tr(\widehat C^{\varphi\varphi})/D$.
+
+%=====================================================================
+\section{What the kernel can and cannot add}\label{sec:theory}
+%=====================================================================
+
+Throughout this section $\Phi_o=[\vphi(\z^o_1),\dots,\vphi(\z^o_n)]\in\R^{D\times n}$ collects old-task kernel features, and $\widehat K=\Phi_o^{\top}\Phi_o$ is the RFF Gram matrix. In the exact kernel limit ($D\to\infty$), $\widehat K\to K$ with $K_{ij}=k_\sigma(\z^o_i,\z^o_j)$.
+
+\subsection{Raising $D$ does not create room}
+\begin{proposition}[Protected dimension is set by the Gram spectrum]\label{prop:Dindep}
+The nonzero eigenvalues of $C^{\varphi\varphi}=\frac1n\Phi_o\Phi_o^{\top}$ equal those of $\frac1n\widehat K$. If $\widehat K=\sum_i\kappa_i\bm a_i\bm a_i^{\top}$, the corresponding unit eigenvectors are $\vu_i=\Phi_o\bm a_i/\sqrt{\kappa_i}$ (kernel PCA~\cite{kpca}). Therefore, for any energy criterion, the number of protected directions $\dim\M^\varphi$ depends only on the spectrum of $\widehat K$, is at most $\min(n,D)$, and converges as $D\to\infty$ to a quantity set by $K$ alone.
+\end{proposition}
+\begin{proof}
+$\Phi\Phi^{\top}$ and $\Phi^{\top}\Phi$ share their nonzero eigenvalues (SVD of $\Phi$), and $\Phi\Phi^{\top}\Phi\bm a_i=\kappa_i\Phi\bm a_i$ with $\|\Phi\bm a_i\|^2=\kappa_i$. Convergence follows from $\widehat K\to K$ entrywise (Lemma~\ref{lem:rff}).
+\end{proof}
+
+The ratio $\dim\M^\varphi/D$ can thus be pushed toward zero simply by increasing $D$, without changing anything that matters. \emph{We never report it as ``free capacity''.} The quantities that matter are $\nu_t$ and $\iota_t$ (Definition~\ref{def:nu}).
+
+\subsection{The kernel residual is a GP posterior variance}
+\begin{proposition}\label{prop:gp}
+In the exact RKHS of $k_\sigma$, with $K$ invertible (true for the Gaussian kernel at distinct points~\cite{micchelli}), the squared distance from $\vphi(\z)$ to $\spn\{\vphi(\z^o_i)\}_{i\le n}$ is
+\begin{equation}\label{eq:gpvar}
+\dist^2\big(\vphi(\z),\spn\Phi_o\big)=k_\sigma(\z,\z)-\bm k_o(\z)^{\top}K^{-1}\bm k_o(\z),\qquad \bm k_o(\z)_i=k_\sigma(\z^o_i,\z).
+\end{equation}
+This is the noise-free Gaussian-process posterior variance at $\z$ given the old inputs, also called the Nystr\"om residual~\cite{nystrom,gpml}. If $\M^\varphi$ keeps only the top $m$ kernel principal components, then
+$\dist^2(\vphi(\z),\M^\varphi)=k_\sigma(\z,\z)-\sum_{i\le m}\big(\bm a_i^{\top}\bm k_o(\z)\big)^2/\kappa_i$.
+\end{proposition}
+\begin{proof}
+Orthogonal projection onto $\spn\Phi_o$ has squared norm $\bm k_o^{\top}K^{-1}\bm k_o$ (normal equations), and $\|\vphi(\z)\|^2=k_\sigma(\z,\z)$. The truncated formula uses $\vu_i^{\top}\vphi(\z)=\bm a_i^{\top}\bm k_o(\z)/\sqrt{\kappa_i}$.
+\end{proof}
+
+Combined with Proposition~\ref{prop:hybrid}(ii), the kernel block protects an old input \emph{to the extent that it lies within roughly $\sigma$ of old training inputs}. This is a local, statistical guarantee: its expectation over the old distribution is controlled by kernel-PCA generalization bounds~\cite{shawetaylor}. It is not the worst-case, whole-subspace guarantee of the linear block.
+
+\subsection{Locality: where the extra room comes from}
+\begin{lemma}[Separated inputs are nearly orthogonal in feature space]\label{lem:locality}
+In the exact RKHS, let $\z$ satisfy $\min_i\|\z-\z^o_i\|\ge\delta$. Then
+\begin{equation}\label{eq:locality}
+\dist^2\big(\vphi(\z),\spn\Phi_o\big)\;\ge\;1-\frac{n\,e^{-\delta^2/\sigma^2}}{\lambda_{\min}(K)} .
+\end{equation}
+\end{lemma}
+\begin{proof}
+Each entry of $\bm k_o(\z)$ is at most $e^{-\delta^2/(2\sigma^2)}$, so $\|\bm k_o\|^2\le n e^{-\delta^2/\sigma^2}$, and $\bm k_o^{\top}K^{-1}\bm k_o\le\|\bm k_o\|^2/\lambda_{\min}(K)$. Then apply Eq.~\eqref{eq:gpvar} with $k_\sigma(\z,\z)=1$.
+\end{proof}
+
+New-task inputs can be \emph{linearly} inside the old span, so $(I-P^x)\x\approx 0$, yet far from every old input in \emph{location}. In that case their kernel features are almost entirely outside $\M^\varphi$. This is the mechanism by which the lift escapes Lemma~\ref{lem:ceiling}.
+
+The same lemma shows the price. If $\sigma$ is so small that \emph{within-task} distances also exceed several $\sigma$, then held-out points of the new task are nearly orthogonal to its training points. $B_t$ built from training tokens then captures little held-out energy, so $\nu_t$ is small: the adapter memorizes instead of generalizing. The useful regime is
+\begin{equation}\label{eq:regime}
+\delta_{\text{within}}\;\lesssim\;\sigma\;\ll\;\delta_{\text{between}},
+\end{equation}
+where the $\delta$'s are typical nearest-neighbour distances within the new task and from the new task to old tasks. Whether Eq.~\eqref{eq:regime} can be met for ViT k/v inputs is an empirical question, answered by the diagnostics in Section~\ref{sec:phase0}. We expect it to be easier for domain-incremental sequences (DomainNet) than for class-incremental splits of one image distribution.
+
+\subsection{High-dimensional linearization (the main risk)}\label{sec:highdim}
+Write $c_{ij}=\z_i^{\top}\z_j$ and $f(c)=\exp(-(1-c)/\sigma^2)$, so $K_{ij}=f(c_{ij})$. In high dimension, off-diagonal cosines concentrate around a typical value $\bar c$ (El Karoui~\cite{elkaroui} gives the rigorous operator-norm version). A first-order Taylor expansion of the off-diagonal entries, with $f'(\bar c)=f(\bar c)/\sigma^2$, gives
+\begin{equation}\label{eq:linearize}
+K\;\approx\;a\,\bm 1\bm 1^{\top}+b\,Z^{\top}Z+\upsilon\,I,\qquad
+b=\frac{f(\bar c)}{\sigma^2},\quad a=f(\bar c)\Big(1-\frac{\bar c}{\sigma^2}\Big),\quad \upsilon=1-a-b,
+\end{equation}
+where $Z=[\z_1,\dots,\z_n]$ and $\upsilon$ corrects the diagonal to $K_{ii}=1$. The neglected term is $\frac{f(\bar c)}{2\sigma^4}(c_{ij}-\bar c)^2$. This is our own first-order derivation under the concentration assumption.
+
+The three parts of Eq.~\eqref{eq:linearize} behave very differently:
+\begin{itemize}[nosep]
+\item $a\bm1\bm1^{\top}$ is a single direction shared by all tokens. It is protected at task 1 and is harmless.
+\item $b\,Z^{\top}Z$ is the \emph{linear} geometry again. It saturates exactly like InfLoRA.
+\item $\upsilon I$ is a sample-private component. It inflates the novelty $\rho^\varphi_t$, but contributes nothing on held-out data.
+\end{itemize}
+Genuinely nonlinear structure enters only through the neglected second-order term, i.e.\ when cosines have non-negligible spread relative to $\sigma^2$. That happens for clustered data, not for isotropic data.
+
+With $\sigma$ set by Eq.~\eqref{eq:sigma}, $\sigma^2\approx c_\sigma^2\cdot 2(1-\bar c)$, so $(1-\bar c)/\sigma^2\approx 1/(2c_\sigma^2)$. The structured share of the diagonal is then
+$a+b=f(\bar c)\big(1+(1-\bar c)/\sigma^2\big)$:
+
+\begin{center}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+$c_\sigma$ & 0.25 & 0.5 & 1 & 2\\
+\midrule
+$f(\bar c)$ (typical off-diagonal kernel value) & $3.4\times10^{-4}$ & $0.135$ & $0.607$ & $0.882$\\
+structured share $a+b$ & $0.003$ & $0.41$ & $0.91$ & $0.993$\\
+private share $\upsilon$ & $0.997$ & $0.59$ & $0.09$ & $0.007$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+A large $\sigma$ makes the kernel block nearly affine in the cosine, giving no gain over InfLoRA. A small $\sigma$ makes it nearly the identity (memorization). This is why our primary metric is the held-out signal $\nu_t$: the private component $\upsilon I$ is invisible to it by construction.
+
+\subsection{Connection to forgetting theory}
+In the NTK analysis of Doan et~al.~\cite{doan}, forgetting is governed by the cosines of the principal angles between task feature subspaces. Projection methods reduce it by replacing the leading singular value with the largest \emph{unprotected} one. Kernelized InfLoRA keeps the same structure, but in feature space. The relevant overlap is measured by \emph{kernel} principal angles~\cite{wolfshashua}:
+\begin{equation}\label{eq:kpa}
+\cos\theta_i=\sigma_i\big(R_o^{-\top}K_{on}R_n^{-1}\big),\qquad K_{oo}+\lambda I=R_o^{\top}R_o,\;K_{nn}+\lambda I=R_n^{\top}R_n,
+\end{equation}
+computed between the top kernel principal subspaces of the old and new tasks. A ridge $\lambda$ is required, because unregularized angles between sample spans are trivially non-zero in a strictly positive-definite RKHS.
+
+%=====================================================================
+\section{Complexity}\label{sec:cost}
+%=====================================================================
+
+Per token, per kernel block, in multiply-accumulates (MACs), with $d=768$, $D=2048$, $q=d$ and $r=10$. One ViT-B/16 block costs about $7.4$M MACs per token (QKV $1.77$M, output projection $0.59$M, MLP $4.72$M, attention $\approx0.3$M).
+
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Component & Linear InfLoRA & Kernel, $D=2048$ & Kernel, $D=4096$\\
+\midrule
+$\Omega\z$ (shared by $\bm k,\bm v$) & -- & $0.79$M & $1.57$M\\
+$\Delta^\varphi_k\vphi,\ \Delta^\varphi_v\vphi$ & 0 (merged) & $3.15$M & $6.29$M\\
+Overhead per kernel block & $0\%$ & $\approx 53\%$ & $\approx 106\%$\\
+Whole network, $|\Lk|=6$ & $0\%$ & $\approx 27\%$ & $\approx 53\%$\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Parameters.}
+\begin{itemize}[nosep]
+\item Trainable parameters per task are unchanged: $2\cdot d r=15{,}360$ per block ($A^k_t,A^v_t$).
+\item Frozen $B_t$ grows from $r d$ to $r(d+D)$ per block and task.
+\item $\Omega$ is regenerated from the seed, so it costs no storage.
+\item The protected bases need $D\cdot\dim\M^\varphi$ floats per kernel block.
+\end{itemize}
+
+\paragraph{Second-moment memory.}
+$C^\psi$ has $p^2=(2816)^2\approx7.9$M entries, about $32$MB in fp32, per kernel block. That is fine.
+
+The current code, however, accumulates via \code{torch.bmm(x.permute(0,2,1), x).sum(0)}, which materializes a \emph{batch}$\times p\times p$ tensor. For batch 128 that is about $4$GB at $p=2816$. Our implementation replaces it with \code{X.reshape(-1,p).T @ X.reshape(-1,p)}, a single $p\times p$ product.
+
+\paragraph{SVD.}
+One $p\times p$ SVD per kernel block per task takes seconds on a GPU and $<1$ minute in NumPy.
+
+%=====================================================================
+\section{Experimental protocol}\label{sec:experiments}
+%=====================================================================
+
+\subsection{Phase 0: offline go/no-go diagnostics (no training)}\label{sec:phase0}
+Run the frozen backbone with linear InfLoRA trained as usual and cache the block inputs $\x$ of every kernel block, for training and held-out tokens of every task. Subsample about $5{,}000$ tokens per task per layer. For each layer and task, and for $c_\sigma\in\{0.25,0.5,1,2,4\}$ and $q\in\{d,256,128\}$, compute:
+
+\begin{enumerate}[nosep]
+\item \textbf{Distance structure.}
+\begin{itemize}[nosep]
+\item Effective rank $r_{\rm eff}=(\tr\Sigma)^2/\tr(\Sigma^2)$ of the centered inputs.
+\item Mean and spread of within-task vs.\ between-task cosines $c_{ij}$.
+\item The gap ratio $(\E\delta_b^2-\E\delta_w^2)/\E\delta_w^2$.
+\end{itemize}
+\item \textbf{Linearization check.} Fit Eq.~\eqref{eq:linearize} to the empirical $K$ by least squares in $(a,b,\upsilon)$ and report $\|K-K_{\rm fit}\|_2/\|K\|_2$. A residual near $0$ means the kernel block is effectively linear at that bandwidth.
+\item \textbf{Novelty} $\rho_t$ (Eq.~\eqref{eq:rho}) for the linear block and the kernel block.
+\item \textbf{Held-out signal and leakage} $\nu_t,\iota_t$ (Eq.~\eqref{eq:nu}), with $B_t$ built from training tokens by Eq.~\eqref{eq:kBt}, for linear InfLoRA and for the hybrid.
+\item \textbf{Protection of held-out old tokens}: the GP variance (Eq.~\eqref{eq:gpvar}) of held-out old-task tokens against $\M^\varphi$, compared with the linear residual $\|(I-P^x)\x\|^2/\|\x\|^2$.
+\item \textbf{Kernel principal angles} (Eq.~\eqref{eq:kpa}) between old and new tasks, and between two disjoint halves of the same task (the control).
+\item \textbf{Protected dimension} $\dim\M^\varphi_t$ and $\dim\M^x_t$ against $t$, for several $\varepsilon^\varphi$ and caps.
+\end{enumerate}
+
+\paragraph{Go/no-go criterion.} Proceed to training only if there is a bandwidth at which, for later tasks ($t>T/2$) and in at least half of the kernel layers,
+\[
+\nu^{\rm hybrid}_t \;\ge\; \nu^{\rm lin}_t+\Delta_\nu
+\quad\text{and}\quad
+\iota^{\rm hybrid}_t\;\le\;\iota^{\rm lin}_t+\Delta_\iota ,
+\]
+with, for example, $\Delta_\nu=0.05$ and $\Delta_\iota=0.01$. If $\nu$ improves only when the linearization residual (item 2) is near $0$, the gain is the private component $\upsilon I$ and will not transfer.
+
+\subsection{Phase 1: implementation}
+See Section~\ref{sec:impl}.
+
+\subsection{Phase 2: long-sequence training}
+\paragraph{Benchmarks.}
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Sequence & Classes/task & Tasks & Note\\
+\midrule
+ImageNet-R / 10 & 20 & 10 & sanity check vs.\ reported InfLoRA\\
+ImageNet-R / 20 & 10 & 20 & \code{configs/mimg20\_inflora.json}\\
+ImageNet-R / 50 & 4 & 50 & long sequence\\
+CIFAR-100 / 50 & 2 & 50 & long sequence\\
+DomainNet & see config & -- & domain shift (locality should help most)\\
+\bottomrule
+\end{tabular}
+\end{center}
+In the configs, ``Classes/task'' sets both \code{init\_cls} and \code{increment}, and ``Tasks'' sets the number of sessions (\code{total\_sessions}).
+
+E$^2$-LoRA~\cite{e2lora} reports InfLoRA at $60.49\%$ (ImageNet-R/50) and $56.65\pm5.55\%$ (CIFAR-100/50). Their split protocol must be checked and matched before comparing numbers. InfLoRA is re-run on exactly our splits in any case.
+
+\paragraph{Baselines.}
+\begin{enumerate}[nosep]
+\item InfLoRA (re-run).
+\item InfLoRA with tuned thresholds $(\varepsilon_b,\varepsilon_e)$. This separates ``better thresholding'' from ``kernel''.
+\item \textbf{Linear random lift}: $\vpsi=[\x;\alpha G\z]$ with a Gaussian $G\in\R^{D\times q}$ and no nonlinearity. Its span is at most $q$-dimensional, so Lemma~\ref{lem:ceiling} predicts no gain. This isolates the nonlinearity, as in RanPAC~\cite{ranpac}.
+\item InfLoRA with a larger rank (same trainable budget as $r$ is varied).
+\item BiLoRA~\cite{bilora}, if code is available.
+\end{enumerate}
+
+\paragraph{Ablations.}
+\begin{itemize}[nosep]
+\item $c_\sigma$, $D\in\{1024,2048,4096\}$, $\gamma\in\{0.25,1,4\}$, $q$.
+\item $\Lk\in\{$last 4, last 6, all 12$\}$.
+\item Block-separable vs.\ joint protected subspace.
+\item $\varepsilon^\varphi$ schedule and cap $k^\varphi_{\max}$.
+\item RFF vs.\ random ReLU features $\vphi(\z)=\sqrt{1/D}\max(0,G\z)$.
+\end{itemize}
+
+\paragraph{Metrics.}
+\begin{itemize}[nosep]
+\item Final and average accuracy.
+\item Accuracy with the task identity given (``top1 with task''), which isolates the backbone from task confusion.
+\item Accuracy on the newest task as a function of $t$ (the plasticity curve).
+\item Average forgetting.
+\item Per layer: $\nu_t$, $\iota_t$, $\dim\M^x_t$, $\dim\M^\varphi_t$.
+\item Wall-clock time and GPU memory.
+\end{itemize}
+
+\paragraph{Hypotheses.}
+\begin{itemize}[nosep]
+\item[H1] For linear InfLoRA, $\nu_t$ decreases with $t$ and correlates with the drop in newest-task accuracy on long sequences.
+\item[H2] At a bandwidth satisfying Eq.~\eqref{eq:regime}, the hybrid raises $\nu_t$ on late tasks at comparable $\iota_t$.
+\item[H3] Gains grow with sequence length and are largest on DomainNet; at 10 tasks they are small.
+\item[H4] The linear random lift gives no gain.
+\end{itemize}
+
+%=====================================================================
+\section{Implementation plan}\label{sec:impl}
+%=====================================================================
+
+\subsection{Files}
+\begin{description}[style=nextline,leftmargin=1.5em]
+\item[\code{models/vit\_inflora\_kernel.py} (new, derived from \code{vit\_inflora.py})]
+Class \code{Attention\_KLoRA}:
+\begin{itemize}[nosep]
+\item Buffers \code{mu} ($d$), \code{S} ($q\times d$), \code{Omega} ($D/2\times q$), and scalars \code{sigma}, \code{alpha}, plus a flag \code{use\_kernel}.
+\item \code{lora\_A\_k/v[t] = nn.Linear(p, r)}.
+\item A method \code{psi(x)} implementing Eq.~\eqref{eq:psi}.
+\item The forward pass computes $\vpsi$ once and applies Eq.~\eqref{eq:kadapter}.
+\item \code{cur\_matrix} is $p\times p$, accumulated with the reshape-matmul of Section~\ref{sec:cost}.
+\item A calibration buffer stores a token subsample for Eqs.~\eqref{eq:mu}--\eqref{eq:alpha}.
+\end{itemize}
+\item[\code{models/sinet\_inflora\_kernel.py} (new)]
+Same as \code{sinet\_inflora.py}, but builds the ViT with \code{Attention\_KLoRA} and passes $\Lk$, $D$, $c_\sigma$, $\gamma$, $q$.
+\item[\code{methods/inflora\_kernel.py} (new, subclass of \code{InfLoRA})]
+\begin{itemize}[nosep]
+\item Calibration at task 1 (Algorithm~\ref{alg:calib}).
+\item Block-separable projection for $B_t$ (Eq.~\eqref{eq:kBt}).
+\item Per-block DualGPM with the Remark~\ref{rem:bug} fix and the cap (Algorithm~\ref{alg:gpm}).
+\item Logging of $\dim\M$, $\rho_t$ and $\nu_t$ via \code{logging} rather than \code{print}.
+\end{itemize}
+\item[\code{utils/factory.py}] Register \code{'inflora\_kernel'}.
+\item[\code{configs/*\_kinflora.json} (new)] Add the keys \code{kernel\_layers}, \code{rff\_dim}, \code{sigma\_mult}, \code{gamma}, \code{pre\_dim}, \code{lamb\_phi}, \code{lame\_phi}, \code{kmax\_phi}, \code{rff\_seed}.
+\item[\code{tools/kernel\_diagnostics.py} (new)] The Phase-0 diagnostics on cached features.
+\end{description}
+
+\subsection{Algorithms}
+
+\begin{algorithm}[h]
+\caption{Calibrate the feature map of kernel block $\ell$ (task 1 only)}\label{alg:calib}
+\begin{algorithmic}[1]
+\Require task-1 training tokens $\{\x_n\}$ at block $\ell$, hyperparameters $D,q,c_\sigma,\gamma$, seed
+\State $\vmu\gets\frac1{N_1}\sum_n\x_n$;\quad $\alpha\gets\sqrt{\gamma\cdot\frac1{N_1}\sum_n\|\x_n\|^2}$
+\State $S\gets I_d$ \textbf{or} top-$q$ eigenvectors of $\frac1{N_1}\sum_n(\x_n-\vmu)(\x_n-\vmu)^{\top}$
+\State $\z_n\gets S(\x_n-\vmu)/\|S(\x_n-\vmu)\|$ for a random subsample of $\approx10^4$ tokens
+\State $\sigma\gets c_\sigma\cdot\operatorname{median}_{i\neq j}\|\z_i-\z_j\|$
+\State Draw $\Omega\in\R^{D/2\times q}$ by stacked ORF blocks with the fixed seed
+\State \textbf{freeze} $(\vmu,S,\alpha,\sigma,\Omega)$ for the rest of the sequence
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[h]
+\caption{Learn task $t$ with Kernelized InfLoRA}\label{alg:task}
+\begin{algorithmic}[1]
+\Require network with frozen $W$, adapters $\{A_s,B_s\}_{s<t}$, protected bases $\{\M^x_{t-1},\M^\varphi_{t-1}\}$ per block
+\State Forward pass over task-$t$ training data (with $A_t=0$); accumulate $C^\psi_t$ per block \Comment{Eq.~\eqref{eq:Cpsi}}
+\If{$t=1$} run Algorithm~\ref{alg:calib} for every $\ell\in\Lk$ \textbf{before} accumulating $C^\psi_1$ \EndIf
+\For{each block $\ell$}
+  \State $P\gets\blkdiag(P^x_{t-1},P^\varphi_{t-1})$ (just $P^x_{t-1}$ if $\ell\notin\Lk$)
+  \State $B_t\gets\frac1{\sqrt3}\topr\big((I-P)C^\psi_t\big)^{\top}$; set \code{lora\_A\_k[t]} $=$ \code{lora\_A\_v[t]} $=B_t$ \Comment{Eq.~\eqref{eq:kBt}}
+\EndFor
+\State Train $A^k_t,A^v_t$ and the task-$t$ head with cross-entropy on task-$t$ classes (unchanged)
+\State Forward pass over task-$t$ training data; accumulate $C^{xx}_t$, $C^{\varphi\varphi}_t$ per block
+\For{each block $\ell$}
+  \State $\M^x_t\gets$ \Call{DualGPM}{$\M^x_{t-1}$, $C^{xx}_t$, $\varepsilon^x_t$, $\infty$}
+  \If{$\ell\in\Lk$} $\M^\varphi_t\gets$ \Call{DualGPM}{$\M^\varphi_{t-1}$, $C^{\varphi\varphi}_t$, $\varepsilon^\varphi_t$, $k^\varphi_{\max}$} \EndIf
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[h]
+\caption{DualGPM on one block, with the task-1 fix and a cap}\label{alg:gpm}
+\begin{algorithmic}[1]
+\Function{DualGPM}{$\M$, $C\in\R^{m\times m}$, $\varepsilon$, $k_{\max}$}
+\State $E\gets\|C\|_F^2$
+\If{$\M=\emptyset$} \Comment{first task}
+  \State $(\hat\vu_i,\hat\lambda_i)\gets$ SVD of $C$;\; $k\gets\min\{\#\{i:\sum_{j\le i}\hat\lambda_j^2/E<\varepsilon\},\,k_{\max}\}$, at least 1
+  \If{$k<m/2$} \Return remove-mode basis $U=[\hat\vu_1..\hat\vu_k]$
+  \Else \;\Return retain-mode basis $V=[\hat\vu_{k+1}..\hat\vu_m]$ \Comment{fix: store the complement}
+  \EndIf
+\ElsIf{$\M$ in remove mode with basis $U$}
+  \State $\widehat C\gets(I-UU^{\top})C$;\; $(\hat\vu_i,\hat\lambda_i)\gets$ SVD;\; $a\gets(E-\|\widehat C\|_F^2)/E$;\; $k\gets0$
+  \While{$a<\varepsilon$ \textbf{and} $k<k_{\max}$} $k\gets k+1$;\; $a\gets a+\hat\lambda_k^2/E$ \EndWhile
+  \State $U\gets[U,\hat\vu_1..\hat\vu_k]$;\; \textbf{if} $\operatorname{cols}(U)>m/2$ \textbf{then} switch to retain mode with $V=U^{\perp}$
+\Else \Comment{retain mode with free-space basis $V$}
+  \State $\widehat C\gets VV^{\top}C$;\; $(\hat\vu_i,\hat\lambda_i)\gets$ SVD;\; $a\gets\|\widehat C\|_F^2/E$;\; $k\gets0$
+  \While{$a\ge1-\varepsilon$ \textbf{and} $k<k_{\max}$} $k\gets k+1$;\; $a\gets a-\hat\lambda_k^2/E$ \EndWhile
+  \State $V\gets$ first $\operatorname{cols}(V)-k$ left singular vectors of $(I-\hat U_k\hat U_k^{\top})V$
+\EndIf
+\State \Return updated basis and mode
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Hyperparameters}
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Symbol & Config key & Default & Sweep\\
+\midrule
+$\Lk$ & \code{kernel\_layers} & blocks 7--12 & last 4 / last 6 / all\\
+$D$ & \code{rff\_dim} & 2048 & 1024, 2048, 4096\\
+$c_\sigma$ & \code{sigma\_mult} & 1.0 & 0.25, 0.5, 1, 2, 4\\
+$\gamma$ & \code{gamma} & 1.0 & 0.25, 1, 4\\
+$q$ & \code{pre\_dim} & $d$ (no pre-projection) & 256, 128\\
+$(\varepsilon^\varphi_b,\varepsilon^\varphi_e)$ & \code{lamb\_phi}, \code{lame\_phi} & (0.90, 0.95) & (0.95, 0.99)\\
+$k^\varphi_{\max}$ & \code{kmax\_phi} & 64 & 32, 128, $\infty$\\
+$r$ & \code{rank} & 10 & --\\
+$(\varepsilon^x_b,\varepsilon^x_e)$ & \code{lamb}, \code{lame} & as in InfLoRA configs & --\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Unit tests before any training}
+\begin{enumerate}[nosep]
+\item $\|\vphi(\z)\|=1$ to machine precision, and $\vphi(\z)^{\top}\vphi(\z')\approx k_\sigma(\z,\z')$ with error $O(D^{-1/2})$.
+\item With $\gamma\to0$ (i.e.\ $\alpha=0$), Kernelized InfLoRA reproduces InfLoRA's accuracy on CIFAR-100/10 to within seed noise.
+\item After training task $t$, $\max_{\x\in\text{train}_{<t}}\|B_t\vpsi(\x)\|/\|\vpsi(\x)\|$ is consistent with the energy thresholds, and $B_tP_{t-1}=0$ to machine precision (Proposition~\ref{prop:hybrid}).
+\item $\vphi$ and all calibration buffers are bit-identical before and after every task.
+\end{enumerate}
+
+%=====================================================================
+\section{Summary of the design decisions}
+%=====================================================================
+\begin{enumerate}[nosep]
+\item The lift must be \emph{nonlinear}. No linear map, of any rank, escapes Lemma~\ref{lem:ceiling}.
+\item The lift must be \emph{frozen} after task 1. Otherwise old bases and summed adapters are invalidated.
+\item The linear block is kept and protected separately, which preserves InfLoRA's worst-case guarantee (Proposition~\ref{prop:hybrid}).
+\item Extra room comes from \emph{locality} (Lemma~\ref{lem:locality}), not from $D$ (Proposition~\ref{prop:Dindep}).
+\item The bandwidth must sit between within-task and between-task scales (Eq.~\eqref{eq:regime}). Diagnostics must use \emph{held-out} data to avoid the private component of Eq.~\eqref{eq:linearize}.
+\item Gains are expected on long and domain-shifted sequences, not at 10 tasks.
+\end{enumerate}
+
+%=====================================================================
+\begin{thebibliography}{99}
+%=====================================================================
+\bibitem{inflora} Y.-S. Liang and W.-J. Li. InfLoRA: Interference-free low-rank adaptation for continual learning. In \emph{CVPR}, 2024. arXiv:2404.00228.
+\bibitem{api} Y.-S. Liang and W.-J. Li. Adaptive plasticity improvement for continual learning. In \emph{CVPR}, 2023.
+\bibitem{gpm} G. Saha, I. Garg, and K. Roy. Gradient projection memory for continual learning. In \emph{ICLR}, 2021. arXiv:2103.09762.
+\bibitem{rff} A. Rahimi and B. Recht. Random features for large-scale kernel machines. In \emph{NIPS}, 2007.
+\bibitem{orf} F. X. Yu, A. T. Suresh, K. Choromanski, D. Holtmann-Rice, and S. Kumar. Orthogonal random features. In \emph{NIPS}, 2016.
+\bibitem{kpca} B. Sch\"olkopf, A. Smola, and K.-R. M\"uller. Nonlinear component analysis as a kernel eigenvalue problem. \emph{Neural Computation}, 10(5):1299--1319, 1998.
+\bibitem{nystrom} C. K. I. Williams and M. Seeger. Using the Nystr\"om method to speed up kernel machines. In \emph{NIPS}, 2000.
+\bibitem{gpml} C. E. Rasmussen and C. K. I. Williams. \emph{Gaussian Processes for Machine Learning}. MIT Press, 2006.
+\bibitem{micchelli} C. A. Micchelli. Interpolation of scattered data: distance matrices and conditionally positive definite functions. \emph{Constructive Approximation}, 2:11--22, 1986.
+\bibitem{shawetaylor} J. Shawe-Taylor, C. K. I. Williams, N. Cristianini, and J. Kandola. On the eigenspectrum of the Gram matrix and the generalization error of kernel-PCA. \emph{IEEE Trans.\ Inf.\ Theory}, 51(7):2510--2522, 2005.
+\bibitem{elkaroui} N. El Karoui. The spectrum of kernel random matrices. \emph{Annals of Statistics}, 38(1):1--50, 2010.
+\bibitem{doan} T. Doan, M. Abbana Bennani, B. Mazoure, G. Rabusseau, and P. Alquier. A theoretical analysis of catastrophic forgetting through the NTK overlap matrix. In \emph{AISTATS}, 2021.
+\bibitem{wolfshashua} L. Wolf and A. Shashua. Learning over sets using kernel principal angles. \emph{JMLR}, 4:913--931, 2003.
+\bibitem{ranpac} M. D. McDonnell, D. Gong, A. Parvaneh, E. Abbasnejad, and A. van den Hengel. RanPAC: Random projections and pre-trained models for continual learning. In \emph{NeurIPS}, 2023. arXiv:2307.02251.
+\bibitem{e2lora} L. Li, L. Qi, Q. Tian, and X. Geng. Energy-structured low-rank adaptation for continual learning. In \emph{ICML}, 2026. arXiv:2605.27482.
+\bibitem{bilora} H. Zhu, Y. Zhang, J. Dong, and P. Koniusz. BiLoRA: Almost-orthogonal parameter spaces for continual learning. In \emph{CVPR}, 2025.
+\end{thebibliography}
+
+\end{document}
