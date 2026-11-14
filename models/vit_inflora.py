@@ -194,8 +194,9 @@ class Attention_LoRA(nn.Module):
         self.psi_k = self.psi_v = None
         feat = r
         if psi is not None:
-            self.psi_k = TaskFeatureMap(psi['kind'], r, psi['m'], n_tasks, psi['sigma_mult'])
-            self.psi_v = TaskFeatureMap(psi['kind'], r, psi['m'], n_tasks, psi['sigma_mult'])
+            scale = psi.get('scale', 1.0)
+            self.psi_k = TaskFeatureMap(psi['kind'], r, psi['m'], n_tasks, psi['sigma_mult'], scale)
+            self.psi_v = TaskFeatureMap(psi['kind'], r, psi['m'], n_tasks, psi['sigma_mult'], scale)
             feat = psi['m']
 
         self.lora_A_k = nn.ModuleList([nn.Linear(dim, r, bias=False) for _ in range(n_tasks)])

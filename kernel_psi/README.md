@@ -21,6 +21,12 @@
 
 **Scale.** Every ψ is scaled so that E‖ψ(u)‖² ≈ ‖u‖², i.e. it starts at the linear adapter's scale.
 
+**Step size (`psi_scale`).** Adam moves every entry of A_t by about lr. With m columns instead of r, the composed rank-r update therefore moves about √(m/r) times faster than InfLoRA's. In the first sweep (`Kernel_adapter_sweep_65429.out`), even the `linear128` control lost 8 points, so the nonlinearity was not the cause.
+- `psi_scale` multiplies ψ's output, which under Adam scales the effective A_t step by the same factor.
+- `psi_scale=auto` sets it to √(r/m), matching InfLoRA's step size.
+- Runs that use it get `_xauto` in their log directory.
+- `kernel_psi/run.sh` reruns the sweep with it.
+
 **What else is unchanged.** Ω is frozen and drawn from its own generator (the run seed), so data order and LoRA initialisation match the baseline exactly. Ω and s are saved in the checkpoints. A_t is d×m instead of d×r, and is still zero-initialised. Only A_t is trained, as in InfLoRA.
 
 ## Run (cluster)

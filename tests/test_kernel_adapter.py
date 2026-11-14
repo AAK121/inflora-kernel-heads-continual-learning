@@ -157,6 +157,24 @@ def test_psi_draws_leave_the_global_rng_alone():
     assert not torch.equal(a.omega, b.omega)  # each layer and k/v gets its own draw
 
 
+@pytest.mark.parametrize('kind', KINDS)
+def test_scale_multiplies_output_and_scales_the_adam_step(kind):
+    torch.manual_seed(0)
+    a, b = TaskFeatureMap(kind, 4, 16, 1), TaskFeatureMap(kind, 4, 16, 1, scale=0.25)
+    b.omega.copy_(a.omega)
+    u = torch.randn(3, 1, 4)
+    assert torch.allclose(b(u), 0.25 * a(u))
+    # one Adam step on A from zero: the step on A is scale-free, so the change of A psi(u) scales with psi_scale
+    outs = []
+    for fm in (a, b):
+        w = torch.zeros(5, 16, requires_grad=True)
+        opt = torch.optim.Adam([w], lr=1e-2)
+        (fm(u) @ w.T).sum().backward()
+        opt.step()
+        outs.append(fm(u) @ w.detach().T)
+    assert torch.allclose(outs[1], 0.25 * outs[0], atol=1e-6)
+
+
 def test_merged_matrix_helpers_refuse_psi():
     attn = _attn('relu')
     with pytest.raises(NotImplementedError):
@@ -165,9 +183,13 @@ def test_merged_matrix_helpers_refuse_psi():
 
 def test_config_and_tag():
     assert psi_config({}) is None and psi_tag({'psi': 'none'}) == ''
-    assert psi_config({'psi': 'RFF', 'psi_dim': 64, 'psi_sigma': 2}) == {'kind': 'rff', 'm': 64, 'sigma_mult': 2.0}
+    assert psi_config({'psi': 'RFF', 'psi_dim': 64, 'psi_sigma': 2}) == {'kind': 'rff', 'm': 64, 'sigma_mult': 2.0,
+                                                                          'scale': 1.0}
     assert psi_tag({'psi': 'rff', 'psi_dim': 64, 'psi_sigma': 0.5}) == '_psi-rff64_s0.5'
     assert psi_tag({'psi': 'relu', 'psi_dim': 128}) == '_psi-relu128'
+    assert psi_config({'psi': 'linear', 'psi_dim': 40, 'rank': 10, 'psi_scale': 'auto'})['scale'] == 0.5
+    assert psi_tag({'psi': 'linear', 'psi_dim': 128, 'psi_scale': 'auto'}) == '_psi-linear128_xauto'
+    assert psi_tag({'psi': 'relu', 'psi_dim': 32, 'psi_scale': 0.25}) == '_psi-relu32_x0.25'
     with pytest.raises(ValueError):
         TaskFeatureMap('poly', 3, 8, 1)
     with pytest.raises(ValueError):
