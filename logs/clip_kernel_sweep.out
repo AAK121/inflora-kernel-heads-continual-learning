@@ -1,0 +1,11 @@
+
+CLIP /home/vis-comp/25m2161/clip/ViT-B-16.pt on ImageNet_R (10 tasks), prompts=ensemble
+head                                  final      avg   task-id
+CLIP zero-shot                  77.20 +- 0.00    80.38         -
+relu10k_centerl2+text           83.55 +- 0.00    86.07    0.8927
+rbf5k_centerl2_m1+text          82.53 +- 0.00    85.00    0.8903
+relu10k_centerl2                81.20 +- 0.00    83.10    0.8792
+relu10k_centerl2+text50         81.13 +- 0.00    84.04    0.8778
+linear_centerl2+text            80.52 +- 0.00    83.67    0.8765
+rbf5k_centerl2_m1               78.93 +- 0.00    81.05    0.8665
+linear_centerl2                 70.92 +- 0.00    75.79    0.8162
