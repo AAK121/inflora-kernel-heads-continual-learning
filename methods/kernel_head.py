@@ -18,6 +18,7 @@ Only torch is required; the code sticks to APIs available in torch 1.10.
 """
 import logging
 import math
+import os
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -401,6 +402,52 @@ def build_head(cfg: Optional[Dict], in_dim: int, device=None) -> AnalyticKernelH
                               dtype=dtype, chunk_size=int(cfg.get('chunk_size', 2048)), seed=int(cfg.get('seed', 0)))
     if device is not None:
         head.to(device)
+    return head
+
+
+def save_head(head: AnalyticKernelHead, cfg: Dict, path: str, keep_gram: bool = False,
+              model_state: Optional[Dict] = None, model_config: Optional[Dict] = None, **meta) -> None:
+    """Save a fitted head. Without keep_gram the running sums G (D x D) and Q are dropped:
+    enough for inference (feature map + W), but the head can no longer absorb new tasks.
+    With model_state (an InfLoRA SiNet state dict) and its training config, the network goes
+    into the same file; load both back with load_bundle."""
+    state = {k: v.cpu() for k, v in head.state_dict().items() if keep_gram or k not in ('G', 'Q')}
+    out = {'config': dict(cfg), 'state': state, 'keep_gram': keep_gram, 'meta': meta}
+    if model_state is not None:
+        out['model'] = model_state
+        out['model_config'] = dict(model_config or {})
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    torch.save(out, path)
+
+
+def load_head(path: str, device=None) -> AnalyticKernelHead:
+    """Rebuild a head written by save_head, ready for predict() / logits()."""
+    return _head_from_checkpoint(torch.load(path, map_location='cpu'), device)
+
+
+def load_bundle(path: str, device=None):
+    """Rebuild (network, head) from a file saved with model_state. Predict with
+    head.predict(net.extract_vector(images)); labels are in the run's class order."""
+    from models.sinet_inflora import SiNet  # needs timm: imported only when a network is wanted
+    ckpt = torch.load(path, map_location='cpu')
+    if 'model' not in ckpt:
+        raise ValueError('{} holds only a head (saved without model_state); use load_head'.format(path))
+    cfg = ckpt['model_config']
+    net = SiNet(cfg)
+    net.load_state_dict(ckpt['model'])
+    net.numtask = int(cfg['total_sessions'])
+    net.eval()
+    if device is not None:
+        net.to(device)
+    return net, _head_from_checkpoint(ckpt, device)
+
+
+def _head_from_checkpoint(ckpt: Dict, device=None) -> AnalyticKernelHead:
+    state = ckpt['state']
+    head = build_head(ckpt['config'], state['feature_map.mean'].shape[0], device)
+    head.load_state_dict(state, strict=ckpt['keep_gram'])
+    if not ckpt['keep_gram']:  # free the empty D x D Gram the constructor allocated
+        head.G = torch.zeros(0, 0, dtype=head.G.dtype, device=head.G.device)
     return head
 
 

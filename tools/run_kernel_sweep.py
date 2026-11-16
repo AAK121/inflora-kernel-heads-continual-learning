@@ -6,7 +6,12 @@ Steps (each is skipped if its output already exists, so the script can be re-run
   2. Extract features from those checkpoints, one cache per seed:
      <out>/features_seed<k>.pt
   3. Evaluate every head in --heads on all seeds, compared with InfLoRA's own
-     concatenated heads: <out>/sweep.json and <out>/sweep.txt.
+     concatenated heads: <out>/sweep.json and <out>/sweep.txt (the comparison table).
+     Each head also gets its own folder <out>/<head name>/ with
+       seed<k>.pt    the final InfLoRA network (task_<T-1>.pth) AND the fitted kernel head,
+                     in one file: net, head = methods.kernel_head.load_bundle(path)
+       summary.json  mean result and per-seed curves
+     (--no_bundle saves only the heads, without the ~450 MB network.)
 
 Examples:
   # quick pipeline check (1 epoch, training loop capped at ~10 batches per epoch)
@@ -18,6 +23,10 @@ Examples:
   # ImageNet-R (10 tasks) from a dataset folder elsewhere, 2 seeds
   python tools/run_kernel_sweep.py --config configs/mimg10_inflora.json --data_path /data/imagenet-r \
       --epochs 10 --seeds 0 1 --device 0
+
+  # full schedule, 3 seeds, 4 heads (kernel_head_full/run.sh)
+  python tools/run_kernel_sweep.py --config configs/mimg10_inflora.json --epochs 50 --seeds 0 1 2 \
+      --heads configs/kernel_head_final.json --data_path /data/imagenet-r --device 0 --out checkpoints/kernel_head_full
 """
 import argparse
 import copy
@@ -70,6 +79,7 @@ def main():
     p.add_argument('--smoke', action='store_true', help='1 epoch and capped training loop: checks the pipeline only')
     p.add_argument('--extract_batch_size', type=int, default=128)
     p.add_argument('--data_path', default=None, help="dataset folder; overrides the config's data_path")
+    p.add_argument('--no_bundle', action='store_true', help='save only the heads, not the network with each of them')
     a = p.parse_args()
 
     if a.data_path:
@@ -125,8 +135,14 @@ def main():
     from eval_kernel_heads import format_table, run_sweep, save_json
     with open(a.heads) as fh:
         heads = json.load(fh)
+    bundle = None
+    if not a.no_bundle:
+        bundle = {}
+        for seed in a.seeds:
+            cfg = make_train_config(base_cfg, epochs, seed, a.device, a.smoke)
+            bundle[seed] = (os.path.join(ckpt_dirs[seed], 'task_{}.pth'.format(cfg['total_sessions'] - 1)), cfg)
     t0 = time.time()
-    results = run_sweep(caches, heads, device, only=a.only)
+    results = run_sweep(caches, heads, device, only=a.only, save_dir=out, bundle=bundle)
     timings['sweep_s'] = round(time.time() - t0)
     results['run'] = {'config': a.config, 'epochs_per_task': epochs, 'seeds': a.seeds, 'smoke': a.smoke,
                       'checkpoints': ckpt_dirs, 'heads_file': a.heads, 'timings': timings}
@@ -136,7 +152,8 @@ def main():
     with open(os.path.join(out, 'sweep.txt'), 'w') as fh:
         fh.write(header + table + '\n')
     print('\n' + header + table)
-    print('\nresults in {}/ (sweep.txt, sweep.json); timings {}'.format(out, timings))
+    print('\nresults in {}/ (sweep.txt, sweep.json, one folder per head with seed<k>.pt + summary.json); '
+          'timings {}'.format(out, timings))
 
 
 if __name__ == '__main__':

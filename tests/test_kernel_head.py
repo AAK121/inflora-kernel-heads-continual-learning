@@ -390,6 +390,67 @@ class TestPosthocTool(unittest.TestCase):
         self.assertGreater(curve['top1'][-1], 90.0)
         self.assertEqual(summarize([curve])['n_seeds'], 1)
 
+    def test_saved_head_reloads_with_identical_predictions(self):
+        import tempfile
+        from eval_kernel_heads import evaluate_head
+        from methods.kernel_head import load_head
+        steps, known = [], 0
+        for t in range(2):
+            total = known + 2
+            tr = blobs(40, list(range(known, total)), 16, seed=t)
+            te = blobs(20, list(range(total)), 16, seed=10 + t)
+            steps.append({'known': known, 'total': total, 'train_f': tr[0], 'train_y': tr[1],
+                          'test_f': te[0], 'test_y': te[1], 'base_pred': te[1].clone()})
+            known = total
+        cache = {'meta': {'class_num': 2, 'seed': 0, 'dataset': 'fake', 'ckpt_dir': 'x'}, 'steps': steps}
+        d = tempfile.mkdtemp()
+        for name, cfg, keep in (('relu', {'map': 'relu', 'dim': 256, 'input_norm': 'none'}, False),
+                                ('rbf', {'map': 'rbf', 'dim': 256, 'input_norm': 'center_l2'}, True)):
+            cfg['name'] = name
+            curve = evaluate_head(cache, cfg, save_dir=d, keep_gram=keep)
+            head = load_head(os.path.join(d, name, 'seed0.pt'))
+            acc = (head.predict(steps[-1]['test_f']).cpu() == steps[-1]['test_y']).float().mean().item() * 100
+            self.assertAlmostEqual(acc, curve['top1'][-1], places=1)
+            self.assertEqual(head.W.shape, (256, 4))
+            ckpt = torch.load(os.path.join(d, name, 'seed0.pt'))
+            self.assertEqual('G' in ckpt['state'], keep)
+            self.assertEqual(ckpt['meta']['n_classes'], 4)
+            self.assertNotIn('model', ckpt)
+
+    def test_sweep_bundles_model_with_head_per_folder(self):
+        import json
+        import tempfile
+        from eval_kernel_heads import run_sweep
+        from methods.kernel_head import load_head
+        steps, known = [], 0
+        for t in range(2):
+            total = known + 2
+            tr = blobs(30, list(range(known, total)), 8, seed=t)
+            te = blobs(10, list(range(total)), 8, seed=10 + t)
+            steps.append({'known': known, 'total': total, 'train_f': tr[0], 'train_y': tr[1],
+                          'test_f': te[0], 'test_y': te[1], 'base_pred': te[1].clone()})
+            known = total
+        d = tempfile.mkdtemp()
+        caches, bundle = [], {}
+        for seed in (0, 1):
+            caches.append({'meta': {'class_num': 2, 'seed': seed, 'dataset': 'fake', 'ckpt_dir': 'x'}, 'steps': steps})
+            model_path = os.path.join(d, 'task_1_seed{}.pth'.format(seed))
+            torch.save({'w': torch.full((3,), float(seed))}, model_path)  # stand-in for a SiNet state dict
+            bundle[seed] = (model_path, {'total_sessions': 2, 'seed': [seed]})
+        heads = [{'name': 'lin', 'map': 'linear'}, {'name': 'relu', 'map': 'relu', 'dim': 64}]
+        res = run_sweep(caches, heads, save_dir=d, bundle=bundle)
+        for name in ('lin', 'relu'):
+            for seed in (0, 1):
+                ckpt = torch.load(os.path.join(d, name, 'seed{}.pt'.format(seed)))
+                self.assertTrue(torch.equal(ckpt['model']['w'], torch.full((3,), float(seed))))
+                self.assertEqual(ckpt['model_config']['seed'], [seed])
+                self.assertEqual(ckpt['config']['name'], name)
+                load_head(os.path.join(d, name, 'seed{}.pt'.format(seed)))  # head part still loads alone
+            with open(os.path.join(d, name, 'summary.json')) as fh:
+                summary = json.load(fh)
+            self.assertEqual(sorted(summary['seeds']), ['0', '1'])
+            self.assertEqual(summary['summary']['final_per_seed'], res['heads'][name]['summary']['final_per_seed'])
+
 
 class TestSweepScript(unittest.TestCase):
 
