@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Data, features and model weights (not redistributed)
+data/
+datasets/
+features/
+*.pth
+*.pt
+*.npy
+*.npz
+!kh_runs/**/*.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

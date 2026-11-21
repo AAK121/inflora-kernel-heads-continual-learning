@@ -1,9 +1,0 @@
-LICENSE
-README.md
-pyproject.toml
-inflora_kernel_head.egg-info/PKG-INFO
-inflora_kernel_head.egg-info/SOURCES.txt
-inflora_kernel_head.egg-info/dependency_links.txt
-inflora_kernel_head.egg-info/requires.txt
-inflora_kernel_head.egg-info/top_level.txt
-tests/test_kernel_head.py

@@ -16,7 +16,6 @@ W  = (G + λI)⁻¹ Q ,  logits = φ(f) W
 
 **Default:** RanPAC-style random ReLU features, `D = 10000`, no input normalization, λ chosen by GCV.
 
-- The literature reviews behind this choice are in [agents/05_kernel_classifier_heads_cil.md](agents/05_kernel_classifier_heads_cil.md) and [agents/06_kernel_choice_for_vit_features.md](agents/06_kernel_choice_for_vit_features.md).
 - RBF random Fourier features and a no-lift linear head are included in the sweep.
 
 ## Files
